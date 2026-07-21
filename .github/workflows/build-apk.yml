@@ -23,7 +23,12 @@ jobs:
       with:
         java-version: '17'
         distribution: 'temurin'
-        cache: gradle
+
+    - name: Setup Gradle
+      uses: gradle/actions/setup-gradle@v3
+
+    - name: Regenerate Gradle Wrapper
+      run: gradle wrapper --gradle-version 8.7
 
     - name: Make gradlew executable
       run: chmod +x gradlew
