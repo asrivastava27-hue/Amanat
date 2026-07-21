@@ -27,16 +27,46 @@ jobs:
     - name: Setup Gradle
       uses: gradle/actions/setup-gradle@v3
 
+    - name: Prepare build environment files
+      run: |
+        touch .env
+        touch .env.example
+        if [ ! -f app/google-services.json ]; then
+          cat << 'EOF' > app/google-services.json
+        {
+          "project_info": {
+            "project_number": "108202111114",
+            "project_id": "amanat-a3b65",
+            "storage_bucket": "amanat-a3b65.firebasestorage.app"
+          },
+          "client": [
+            {
+              "client_info": {
+                "mobilesdk_app_id": "1:108202111114:android:9b2575be9e7ccbaa4d7d73",
+                "android_client_info": {
+                  "package_name": "com.aistudio.amanat.kxmpzq"
+                }
+              },
+              "oauth_client": [],
+              "api_key": [
+                {
+                  "current_key": "AIzaSyC7RAFfTu9_EQBhcaqMgd9pwFcD3ily2wY"
+                }
+              ],
+              "services": {
+                "appinvite_service": {
+                  "other_platform_oauth_client": []
+                }
+              }
+            }
+          ],
+          "configuration_version": "1"
+        }
+        EOF
+        fi
+
     - name: Regenerate Gradle Wrapper
       run: gradle wrapper --gradle-version 8.7
-
-    - name: Prepare environment file
-      run: |
-        if [ -f .env.example ]; then
-          cp .env.example .env
-        else
-          touch .env
-        fi
 
     - name: Make gradlew executable
       run: chmod +x gradlew
