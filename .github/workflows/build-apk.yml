@@ -30,6 +30,14 @@ jobs:
     - name: Regenerate Gradle Wrapper
       run: gradle wrapper --gradle-version 8.7
 
+    - name: Prepare environment file
+      run: |
+        if [ -f .env.example ]; then
+          cp .env.example .env
+        else
+          touch .env
+        fi
+
     - name: Make gradlew executable
       run: chmod +x gradlew
 
