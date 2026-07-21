@@ -31,11 +31,14 @@ android {
       keyAlias = "upload"
       keyPassword = System.getenv("KEY_PASSWORD")
     }
-    create("debugConfig") {
-      storeFile = file("${rootDir}/debug.keystore")
-      storePassword = "android"
-      keyAlias = "androiddebugkey"
-      keyPassword = "android"
+    val debugKs = file("${rootDir}/debug.keystore")
+    if (debugKs.exists()) {
+      create("debugConfig") {
+        storeFile = debugKs
+        storePassword = "android"
+        keyAlias = "androiddebugkey"
+        keyPassword = "android"
+      }
     }
   }
 
@@ -45,15 +48,20 @@ android {
       isMinifyEnabled = false
       isShrinkResources = false
       proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
-      // Fallback to debugConfig if release credentials are not set to prevent unsigned build failures
+      // Fallback to debugConfig if release credentials are set/available, otherwise use debug signing
       val hasReleaseKey = System.getenv("STORE_PASSWORD") != null
-      signingConfig = if (hasReleaseKey) {
-        signingConfigs.getByName("release")
-      } else {
-        signingConfigs.getByName("debugConfig")
+      val debugConfigExists = signingConfigs.findByName("debugConfig") != null
+      if (hasReleaseKey) {
+        signingConfig = signingConfigs.getByName("release")
+      } else if (debugConfigExists) {
+        signingConfig = signingConfigs.getByName("debugConfig")
       }
     }
-    debug { signingConfig = signingConfigs.getByName("debugConfig") }
+    debug {
+      if (signingConfigs.findByName("debugConfig") != null) {
+        signingConfig = signingConfigs.getByName("debugConfig")
+      }
+    }
   }
   compileOptions {
     sourceCompatibility = JavaVersion.VERSION_11
