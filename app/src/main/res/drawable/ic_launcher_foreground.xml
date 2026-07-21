@@ -1,0 +1,57 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- The Protective Shield Outer Contour -->
+    <path
+        android:pathData="M54,20 L26,31 L26,54 C26,73.5 37.8,91.5 54,96 C70.2,91.5 82,73.5 82,54 L82,31 L54,20 Z"
+        android:strokeWidth="4"
+        android:strokeColor="#FFA751"
+        android:fillColor="#30FFE259" />
+
+    <!-- Elegant inner shield outline -->
+    <path
+        android:pathData="M54,26 L32,35 L32,54 C32,69.8 41.5,84.4 54,88.2 C66.5,84.4 76,69.8 76,54 L76,35 L54,26 Z"
+        android:strokeWidth="1.5"
+        android:strokeColor="#40FFE259"
+        android:fillColor="#00000000" />
+
+    <!-- Solid gold vintage trusted key in the center of safe-keeping -->
+    <!-- Key Head (Circle) -->
+    <path
+        android:pathData="M54,36 A8,8 0,1 0,54,52 A8,8 0,1 0,54,36 Z"
+        android:strokeWidth="3.5"
+        android:strokeColor="#FFD700"
+        android:fillColor="#FFA751" />
+    
+    <!-- Inner core circle of key head -->
+    <path
+        android:pathData="M54,41 A3,3 0,1 0,54,47 A3,3 0,1 0,54,41 Z"
+        android:fillColor="#FFA751" />
+
+    <!-- Key Shaft -->
+    <path
+        android:pathData="M54,51 L54,74"
+        android:strokeWidth="4"
+        android:strokeColor="#FFD700"
+        android:strokeLineCap="round" />
+
+    <!-- Teeth (horizontal bars representing safe protection) -->
+    <path
+        android:pathData="M54,63 L61,63"
+        android:strokeWidth="3.5"
+        android:strokeColor="#FFA751"
+        android:strokeLineCap="round" />
+    <path
+        android:pathData="M54,70 L61,70"
+        android:strokeWidth="3.5"
+        android:strokeColor="#FFA751"
+        android:strokeLineCap="round" />
+
+    <!-- Subtle elegant decorative star at top representing hope/legacy -->
+    <path
+        android:pathData="M54,12 L55.5,14.5 L58,15 L56,16.5 L56.5,19 L54,17.5 L51.5,19 L52,16.5 L50,15 L52.5,14.5 Z"
+        android:fillColor="#FFE259" />
+</vector>

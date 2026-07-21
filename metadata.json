@@ -1,0 +1,6 @@
+{
+  "name": "Amanat",
+  "description": "Amanat - A digital vault where you store property and financial information for trusted family members to access in case of an emergency.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
