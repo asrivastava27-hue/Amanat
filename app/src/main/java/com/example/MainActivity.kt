@@ -20,7 +20,7 @@ import kotlinx.coroutines.launch
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.shape.*
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
@@ -52,11 +52,41 @@ import android.net.Uri
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.widget.Toast
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.platform.LocalContext
+import android.provider.OpenableColumns
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.ui.theme.*
 import com.google.firebase.FirebaseApp
+import com.google.firebase.analytics.FirebaseAnalytics
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.firestore.FirebaseFirestore
+import android.util.Log
+
+fun getFileNameFromUri(context: Context, uri: Uri): String? {
+    var result: String? = null
+    if (uri.scheme == "content") {
+        val cursor = context.contentResolver.query(uri, null, null, null, null)
+        cursor?.use {
+            if (it.moveToFirst()) {
+                val nameIndex = it.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                if (nameIndex != -1) {
+                    result = it.getString(nameIndex)
+                }
+            }
+        }
+    }
+    if (result == null) {
+        result = uri.path
+        val cut = result?.lastIndexOf('/') ?: -1
+        if (cut != -1) {
+            result = result?.substring(cut + 1)
+        }
+    }
+    return result
+}
 
 // Data Models
 enum class Tab(val title: String) {
@@ -78,13 +108,13 @@ enum class AccessTier(val displayName: String) {
 enum class VaultCategory(val displayName: String) {
     BANKING("Bank & investments"),
     INSURANCE("Insurance policies"),
-    PROPERTY("Property documents"),
+    PROPERTY("Property details"),
     LIABILITIES("Loans & liabilities"),
     PENSION("National Pension Scheme (NPS)"),
     EPF("Employee Provident Fund (EPF)"),
     MESSAGE("Personal messages & special instructions"),
-    OTHER("Others"),
-    EMERGENCY("Important contacts (CA, lawyer, insurance agent, bank relationship manager)")
+    EMERGENCY("Important contacts (CA, lawyer, insurance agent, bank relationship manager)"),
+    OTHER("Others")
 }
 
 data class VaultItem(
@@ -116,14 +146,46 @@ enum class SubscriptionTier(
     val billingCycleText: String,
     val badgeColorHex: Long
 ) {
-    FREE("Standard Free", "₹0", "Forever Free", 0xFF94A3B8),
-    ANNUAL_PRO("Amanat Pro", "₹999", "per year", 0xFF10B981),
-    LIFETIME_HERITAGE("Family Heritage", "₹2,499", "one-time lifetime", 0xFF8B5CF6)
+    FREE_TRIAL("30 Days Free Trial", "₹0", "Free for 30 days", 0xFF10B981),
+    LIFETIME_PACK("Lifetime Pack", "₹499", "one-time lifetime", 0xFF8B5CF6);
+
+    companion object {
+        fun safeValueOf(name: String?): SubscriptionTier {
+            if (name.isNullOrEmpty()) return FREE_TRIAL
+            return try {
+                valueOf(name)
+            } catch (e: Exception) {
+                if (name.contains("LIFETIME", ignoreCase = true) || name.contains("HERITAGE", ignoreCase = true) || name.contains("PRO", ignoreCase = true)) {
+                    LIFETIME_PACK
+                } else {
+                    FREE_TRIAL
+                }
+            }
+        }
+    }
 }
 
 // ViewModel
 class SecureLegacyViewModel(application: Application) : AndroidViewModel(application) {
     private val prefs = application.getSharedPreferences("secure_legacy_prefs", Context.MODE_PRIVATE)
+
+    private var firebaseAnalytics: FirebaseAnalytics? = null
+
+    fun logAnalyticsEvent(eventName: String, params: Map<String, String> = emptyMap()) {
+        try {
+            if (firebaseAnalytics == null) {
+                firebaseAnalytics = FirebaseAnalytics.getInstance(getApplication())
+            }
+            val bundle = Bundle()
+            params.forEach { (key, value) ->
+                bundle.putString(key, value)
+            }
+            firebaseAnalytics?.logEvent(eventName, bundle)
+            Log.d("AmanatAnalytics", "Successfully logged event: $eventName with params $params")
+        } catch (e: Exception) {
+            Log.e("AmanatAnalytics", "Could not log analytics event $eventName: ${e.message}")
+        }
+    }
 
     var adminUsers by mutableStateOf<List<AdminUser>>(emptyList())
     var isAdminAuthenticated by mutableStateOf(false)
@@ -134,22 +196,25 @@ class SecureLegacyViewModel(application: Application) : AndroidViewModel(applica
 
     // Subscription & Payment State
     var subscriptionTier by mutableStateOf(
-        try {
-            SubscriptionTier.valueOf(prefs.getString("subscription_tier", SubscriptionTier.FREE.name) ?: SubscriptionTier.FREE.name)
-        } catch (e: Exception) {
-            SubscriptionTier.FREE
-        }
+        SubscriptionTier.safeValueOf(prefs.getString("subscription_tier", SubscriptionTier.FREE_TRIAL.name))
     )
-    var isSubscribed by mutableStateOf(subscriptionTier != SubscriptionTier.FREE)
-    var subscriptionExpiryDate by mutableStateOf(prefs.getString("subscription_expiry", "July 21, 2027") ?: "July 21, 2027")
+    var isSubscribed by mutableStateOf(true)
+    var subscriptionExpiryDate by mutableStateOf(prefs.getString("subscription_expiry", "30 Days Free Trial Active") ?: "30 Days Free Trial Active")
     var subscriptionTransactionId by mutableStateOf(prefs.getString("subscription_tx_id", "AMN-9842103") ?: "AMN-9842103")
 
     fun subscribeToPlan(tier: SubscriptionTier, paymentMethod: String): String {
         val txId = "AMN-" + (1000000..9999999).random()
         subscriptionTier = tier
-        isSubscribed = (tier != SubscriptionTier.FREE)
+        isSubscribed = true
         subscriptionTransactionId = txId
-        subscriptionExpiryDate = if (tier == SubscriptionTier.LIFETIME_HERITAGE) "Lifetime Access (No Expiry)" else "July 21, 2027"
+        if (tier == SubscriptionTier.FREE_TRIAL) {
+            val calendar = java.util.Calendar.getInstance()
+            calendar.add(java.util.Calendar.DAY_OF_MONTH, 30)
+            val sdf = java.text.SimpleDateFormat("MMM dd, yyyy", java.util.Locale.getDefault())
+            subscriptionExpiryDate = "30-Day Trial (Valid till " + sdf.format(calendar.time) + ")"
+        } else {
+            subscriptionExpiryDate = "Lifetime Access (No Expiry)"
+        }
 
         prefs.edit().apply {
             putString("subscription_tier", tier.name)
@@ -157,16 +222,24 @@ class SecureLegacyViewModel(application: Application) : AndroidViewModel(applica
             putString("subscription_tx_id", txId)
             apply()
         }
+        logAnalyticsEvent("subscribe_plan", mapOf(
+            "tier" to tier.name,
+            "transaction_id" to txId,
+            "payment_method" to paymentMethod,
+            "price" to tier.priceText
+        ))
         return txId
     }
 
     fun cancelSubscription() {
-        subscriptionTier = SubscriptionTier.FREE
+        val prevTier = subscriptionTier.name
+        subscriptionTier = SubscriptionTier.FREE_TRIAL
         isSubscribed = false
         prefs.edit().apply {
-            putString("subscription_tier", SubscriptionTier.FREE.name)
+            putString("subscription_tier", SubscriptionTier.FREE_TRIAL.name)
             apply()
         }
+        logAnalyticsEvent("cancel_subscription", mapOf("previous_tier" to prevTier))
     }
 
     // Firebase Cloud Sync Status
@@ -298,7 +371,27 @@ class SecureLegacyViewModel(application: Application) : AndroidViewModel(applica
     }
 
     fun loadTrustedContacts(): List<TrustedContact> {
-        val jsonStr = prefs.getString("trusted_contacts_json", null) ?: return emptyList()
+        val jsonStr = prefs.getString("trusted_contacts_json", null)
+        val defaultContacts = listOf(
+            TrustedContact(
+                name = "Rahul Sharma",
+                relationship = "Primary Trustee",
+                email = "rahul.sharma@example.com",
+                phone = "+91 98765 43210",
+                tier = AccessTier.FULL_ACCESS
+            ),
+            TrustedContact(
+                name = "Priya Sharma",
+                relationship = "Secondary Trustee",
+                email = "priya.sharma@example.com",
+                phone = "+91 98123 45678",
+                tier = AccessTier.FINANCIAL_ONLY
+            )
+        )
+        if (jsonStr.isNullOrEmpty()) {
+            saveTrustedContacts(defaultContacts)
+            return defaultContacts
+        }
         val list = mutableListOf<TrustedContact>()
         try {
             val array = org.json.JSONArray(jsonStr)
@@ -306,26 +399,36 @@ class SecureLegacyViewModel(application: Application) : AndroidViewModel(applica
                 val obj = array.getJSONObject(i)
                 val tierName = obj.optString("tier", "FULL_ACCESS")
                 val tier = try { AccessTier.valueOf(tierName) } catch(e: Exception) { AccessTier.FULL_ACCESS }
-                list.add(
-                    TrustedContact(
-                        name = obj.optString("name", ""),
-                        relationship = obj.optString("relationship", "Trusted Contact"),
-                        email = obj.optString("email", ""),
-                        phone = obj.optString("phone", ""),
-                        tier = tier
+                val cName = obj.optString("name", "")
+                if (cName.isNotBlank()) {
+                    list.add(
+                        TrustedContact(
+                            name = cName,
+                            relationship = obj.optString("relationship", "Trusted Contact"),
+                            email = obj.optString("email", ""),
+                            phone = obj.optString("phone", ""),
+                            tier = tier
+                        )
                     )
-                )
+                }
             }
         } catch (e: Exception) {
             e.printStackTrace()
         }
-        return list
+        return if (list.isEmpty()) {
+            saveTrustedContacts(defaultContacts)
+            defaultContacts
+        } else list
     }
 
     fun saveLedger() {
         saveVaultItems(vaultItems)
         saveTrustedContacts(trustedContacts)
         saveToFirestore()
+        logAnalyticsEvent("save_ledger", mapOf(
+            "vault_items_count" to vaultItems.size.toString(),
+            "trusted_contacts_count" to trustedContacts.size.toString()
+        ))
     }
 
     fun loadFromFirestoreAndMerge() {
@@ -545,11 +648,23 @@ class SecureLegacyViewModel(application: Application) : AndroidViewModel(applica
             putBoolean("is_registered", true)
             apply()
         }
+        logAnalyticsEvent(FirebaseAnalytics.Event.SIGN_UP, mapOf(
+            "username" to user,
+            "email" to emailAddr
+        ))
     }
 
     var isLoggedIn by mutableStateOf(false)
     var currentTab by mutableStateOf(Tab.MY_VAULT)
     var viewingAs by mutableStateOf("Owner")
+
+    fun selectTab(tab: Tab) {
+        currentTab = tab
+        logAnalyticsEvent(FirebaseAnalytics.Event.SELECT_CONTENT, mapOf(
+            "content_type" to "tab",
+            "item_id" to tab.name
+        ))
+    }
 
     var accessStatus by mutableStateOf(AccessStatus.NO_REQUEST)
     var requestReason by mutableStateOf("")
@@ -564,7 +679,7 @@ class SecureLegacyViewModel(application: Application) : AndroidViewModel(applica
         assetType: String? = null,
         uploadedDocuments: List<String> = emptyList()
     ) {
-        vaultItems = vaultItems + VaultItem(
+        val newItem = VaultItem(
             title = title,
             detail = detail,
             category = category,
@@ -572,7 +687,13 @@ class SecureLegacyViewModel(application: Application) : AndroidViewModel(applica
             assetType = assetType,
             uploadedDocuments = uploadedDocuments
         )
+        vaultItems = vaultItems + newItem
         saveVaultItems(vaultItems)
+        logAnalyticsEvent("add_vault_item", mapOf(
+            "title" to title,
+            "category" to category.name,
+            "has_docs" to (uploadedDocuments.isNotEmpty()).toString()
+        ))
     }
 
     fun updateVaultItem(
@@ -595,11 +716,16 @@ class SecureLegacyViewModel(application: Application) : AndroidViewModel(applica
             }
         }
         saveVaultItems(vaultItems)
+        logAnalyticsEvent("update_vault_item", mapOf(
+            "item_id" to itemId,
+            "title" to title
+        ))
     }
 
     fun deleteVaultItem(itemId: String) {
         vaultItems = vaultItems.filter { it.id != itemId }
         saveVaultItems(vaultItems)
+        logAnalyticsEvent("delete_vault_item", mapOf("item_id" to itemId))
     }
 
     fun uploadDocumentToItem(itemId: String, documentName: String) {
@@ -611,6 +737,7 @@ class SecureLegacyViewModel(application: Application) : AndroidViewModel(applica
             }
         }
         saveVaultItems(vaultItems)
+        logAnalyticsEvent("upload_document", mapOf("item_id" to itemId, "document_name" to documentName))
     }
 
     fun deleteDocumentFromItem(itemId: String, documentName: String) {
@@ -622,12 +749,14 @@ class SecureLegacyViewModel(application: Application) : AndroidViewModel(applica
             }
         }
         saveVaultItems(vaultItems)
+        logAnalyticsEvent("delete_document", mapOf("item_id" to itemId, "document_name" to documentName))
     }
 
     fun addTrustedContact(name: String, relationship: String = "Trusted Contact", email: String, tier: AccessTier = AccessTier.FULL_ACCESS, phone: String = "") {
         if (trustedContacts.size >= 2) return
         trustedContacts = (trustedContacts + TrustedContact(name, relationship, email, phone, tier)).take(2)
         saveTrustedContacts(trustedContacts)
+        logAnalyticsEvent("add_trusted_contact", mapOf("name" to name, "relationship" to relationship, "tier" to tier.name))
     }
 
     fun updateTrustedContactAt(index: Int, name: String, email: String, phone: String) {
@@ -644,6 +773,7 @@ class SecureLegacyViewModel(application: Application) : AndroidViewModel(applica
         }
         trustedContacts = list.take(2)
         saveTrustedContacts(trustedContacts)
+        logAnalyticsEvent("update_trusted_contact", mapOf("index" to index.toString(), "name" to name))
     }
 
     fun deleteTrustedContactAt(index: Int) {
@@ -652,6 +782,7 @@ class SecureLegacyViewModel(application: Application) : AndroidViewModel(applica
             list.removeAt(index)
             trustedContacts = list
             saveTrustedContacts(trustedContacts)
+            logAnalyticsEvent("delete_trusted_contact", mapOf("index" to index.toString()))
         }
     }
 
@@ -659,10 +790,12 @@ class SecureLegacyViewModel(application: Application) : AndroidViewModel(applica
         requestedByContactName = contactName
         requestReason = reason
         accessStatus = AccessStatus.GRACE_PERIOD
+        logAnalyticsEvent("emergency_access_request", mapOf("contact_name" to contactName, "reason" to reason))
     }
 
     fun cancelRequest() {
         accessStatus = AccessStatus.CANCELLED
+        logAnalyticsEvent("emergency_access_cancel", emptyMap())
     }
 
     fun simulateGracePeriodPasses() {
@@ -677,6 +810,7 @@ class SecureLegacyViewModel(application: Application) : AndroidViewModel(applica
         if (accessStatus == AccessStatus.AWAITING_SECOND_CONFIRMATION) {
             secondConfirmerName = confirmerName
             accessStatus = AccessStatus.UNLOCKED
+            logAnalyticsEvent("emergency_access_confirm", mapOf("confirmer" to confirmerName))
         }
     }
 
@@ -775,6 +909,12 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        try {
+            val analytics = FirebaseAnalytics.getInstance(this)
+            analytics.logEvent(FirebaseAnalytics.Event.APP_OPEN, null)
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
         setContent {
             MyApplicationTheme {
                 SecureLegacyApp()
@@ -1265,7 +1405,7 @@ fun HelpSupportDialog(viewModel: SecureLegacyViewModel, onDismiss: () -> Unit) {
 
                         Spacer(modifier = Modifier.height(6.dp))
                         Text(
-                            text = "Upgrade to Amanat Pro or Family Heritage plan. Manage UPI / Card payment methods and view billing receipt.",
+                            text = "Subscribe to 30 Days Free Trial or Lifetime Pack (₹499) for digital estate protection. Manage UPI, Card, and NetBanking payments.",
                             fontSize = 12.sp,
                             color = TextMuted,
                             fontFamily = FontFamily.SansSerif
@@ -1290,7 +1430,6 @@ fun HelpSupportDialog(viewModel: SecureLegacyViewModel, onDismiss: () -> Unit) {
 
 @Composable
 fun TopBarNavigation(viewModel: SecureLegacyViewModel, onExitClick: () -> Unit) {
-    var expandedDropdown by remember { mutableStateOf(false) }
     var saveFeedbackActive by remember { mutableStateOf(false) }
     var showSubscriptionModal by remember { mutableStateOf(false) }
 
@@ -1298,134 +1437,225 @@ fun TopBarNavigation(viewModel: SecureLegacyViewModel, onExitClick: () -> Unit) 
         SubscriptionPaymentDialog(viewModel = viewModel, onDismiss = { showSubscriptionModal = false })
     }
 
-    Column(
+    Card(
         modifier = Modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(14.dp))
-            .background(
-                androidx.compose.ui.graphics.Brush.horizontalGradient(
-                    colors = listOf(
-                        InkNavy,
-                        Color(0xFF233549), // slightly lighter slate-navy for elegant gradient depth
-                        Color(0xFF131E2A)  // deep charcoal-navy
+            .shadow(
+                elevation = 8.dp,
+                shape = RoundedCornerShape(18.dp),
+                spotColor = Color.Black.copy(alpha = 0.5f)
+            )
+            .border(
+                border = BorderStroke(
+                    1.5.dp,
+                    androidx.compose.ui.graphics.Brush.verticalGradient(
+                        colors = listOf(Color(0x40FFFFFF), Color(0x10FFFFFF))
+                    )
+                ),
+                shape = RoundedCornerShape(18.dp)
+            ),
+        shape = RoundedCornerShape(18.dp),
+        colors = CardDefaults.cardColors(containerColor = Color(0xFF111C28)),
+        elevation = CardDefaults.cardElevation(defaultElevation = 8.dp)
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(
+                    androidx.compose.ui.graphics.Brush.verticalGradient(
+                        colors = listOf(
+                            Color(0xFF1E2D3D),
+                            Color(0xFF0F1722)
+                        )
                     )
                 )
-            )
-            .border(BorderStroke(1.dp, Color(0x22FFFFFF)), RoundedCornerShape(14.dp))
-            .padding(12.dp)
-    ) {
-        // Top Row: Brand Logo, Viewing As Dropdown, Lock/Logout, Save, Exit
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
+                .padding(14.dp)
         ) {
-            // Logo and Title with dynamic user name display
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Box(
-                    modifier = Modifier
-                        .size(36.dp)
-                        .clip(androidx.compose.foundation.shape.CircleShape)
-                        .background(
-                            androidx.compose.ui.graphics.Brush.linearGradient(
-                                colors = listOf(SageGreen, Color(0xFF509C88))
-                            )
-                        )
-                        .border(BorderStroke(1.dp, Color(0x33FFFFFF)), androidx.compose.foundation.shape.CircleShape),
-                    contentAlignment = Alignment.Center
+            // Row 1: Brand & User Profile Info
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
-                    Text(
-                        text = if (viewModel.isRegistered && viewModel.registeredUsername.isNotEmpty()) {
-                            viewModel.registeredUsername.take(1).uppercase()
-                        } else {
-                            "A"
-                        },
-                        color = Color.White,
-                        fontFamily = FontFamily.Serif,
-                        fontWeight = FontWeight.Bold,
-                        fontSize = 18.sp
-                    )
-                }
-                Spacer(modifier = Modifier.width(10.dp))
-                Column {
-                    Text(
-                        text = "Amanat",
-                        color = Color.White,
-                        fontFamily = FontFamily.Serif,
-                        fontWeight = FontWeight.Bold,
-                        fontSize = 16.sp,
-                        letterSpacing = 0.5.sp
-                    )
-                    if (viewModel.isRegistered && viewModel.registeredUsername.isNotEmpty()) {
+                    Box(
+                        modifier = Modifier
+                            .size(42.dp)
+                            .shadow(4.dp, androidx.compose.foundation.shape.CircleShape)
+                            .clip(androidx.compose.foundation.shape.CircleShape)
+                            .background(
+                                androidx.compose.ui.graphics.Brush.linearGradient(
+                                    colors = listOf(SageGreen, Color(0xFF34D399))
+                                )
+                            )
+                            .border(BorderStroke(1.5.dp, Color.White.copy(alpha = 0.4f)), androidx.compose.foundation.shape.CircleShape),
+                        contentAlignment = Alignment.Center
+                    ) {
                         Text(
-                            text = viewModel.registeredUsername,
-                            color = Color.White.copy(alpha = 0.65f),
-                            fontSize = 10.sp,
-                            fontWeight = FontWeight.SemiBold,
-                            fontFamily = FontFamily.SansSerif
+                            text = if (viewModel.isRegistered && viewModel.registeredUsername.isNotEmpty()) {
+                                viewModel.registeredUsername.take(1).uppercase()
+                            } else {
+                                "A"
+                            },
+                            color = Color.White,
+                            fontFamily = FontFamily.Serif,
+                            fontWeight = FontWeight.ExtraBold,
+                            fontSize = 20.sp
                         )
-                    } else {
+                    }
+
+                    Column {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(
+                                text = "Amanat",
+                                color = Color.White,
+                                fontFamily = FontFamily.Serif,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 17.sp,
+                                letterSpacing = 0.5.sp
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Surface(
+                                color = Color(0xFF10B981).copy(alpha = 0.2f),
+                                border = BorderStroke(1.dp, Color(0xFF10B981).copy(alpha = 0.5f)),
+                                shape = RoundedCornerShape(12.dp)
+                            ) {
+                                Text(
+                                    text = "HERITAGE",
+                                    fontSize = 8.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = Color(0xFF34D399),
+                                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                )
+                            }
+                        }
+
                         Text(
-                            text = "Secure Heritage",
-                            color = Color.White.copy(alpha = 0.4f),
-                            fontSize = 9.sp,
+                            text = if (viewModel.isRegistered && viewModel.registeredUsername.isNotEmpty()) {
+                                viewModel.registeredUsername
+                            } else {
+                                "Abhishek Srivastava"
+                            },
+                            color = Color.White.copy(alpha = 0.7f),
+                            fontSize = 11.sp,
                             fontWeight = FontWeight.Medium,
                             fontFamily = FontFamily.SansSerif
                         )
                     }
                 }
-            }
 
-            // Subscribe, Save Ledger and Sign Out Buttons
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(4.dp)
-            ) {
-                // Subscription / Upgrade Button
                 Surface(
-                    onClick = { showSubscriptionModal = true },
                     shape = RoundedCornerShape(20.dp),
-                    color = if (viewModel.isSubscribed) Color(0xFF8B5CF6).copy(alpha = 0.25f) else Color(0xFFF59E0B).copy(alpha = 0.25f),
-                    border = BorderStroke(1.dp, if (viewModel.isSubscribed) Color(0xFFA78BFA) else Color(0xFFFBBF24)),
-                    modifier = Modifier.testTag("subscribe_button")
+                    color = Color(0xFF064E3B).copy(alpha = 0.6f),
+                    border = BorderStroke(1.dp, Color(0xFF10B981)),
+                    shadowElevation = 2.dp
                 ) {
                     Row(
-                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp),
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(6.dp)
+                                .clip(androidx.compose.foundation.shape.CircleShape)
+                                .background(Color(0xFF34D399))
+                        )
+                        Text(
+                            text = "SECURED",
+                            color = Color(0xFF34D399),
+                            fontSize = 9.sp,
+                            fontWeight = FontWeight.ExtraBold,
+                            fontFamily = FontFamily.SansSerif,
+                            letterSpacing = 0.5.sp
+                        )
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(12.dp))
+
+            // Row 2: Uncluttered 3D Action Buttons
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                // Subscribe Button
+                Surface(
+                    onClick = { showSubscriptionModal = true },
+                    modifier = Modifier
+                        .weight(1.1f)
+                        .testTag("subscribe_button"),
+                    shape = RoundedCornerShape(12.dp),
+                    color = if (viewModel.isSubscribed) Color(0xFF7C3AED) else Color(0xFFD97706),
+                    shadowElevation = 4.dp,
+                    tonalElevation = 2.dp,
+                    border = BorderStroke(1.dp, Color.White.copy(alpha = 0.35f))
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .background(
+                                androidx.compose.ui.graphics.Brush.verticalGradient(
+                                    colors = if (viewModel.isSubscribed) {
+                                        listOf(Color(0xFF8B5CF6), Color(0xFF6D28D9))
+                                    } else {
+                                        listOf(Color(0xFFF59E0B), Color(0xFFB45309))
+                                    }
+                                )
+                            )
+                            .padding(vertical = 8.dp, horizontal = 6.dp),
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.Center
                     ) {
                         Icon(
                             imageVector = Icons.Default.Star,
-                            contentDescription = "Subscription",
-                            tint = if (viewModel.isSubscribed) Color(0xFFA78BFA) else Color(0xFFFBBF24),
-                            modifier = Modifier.size(12.dp)
+                            contentDescription = "Subscribe",
+                            tint = Color.White,
+                            modifier = Modifier.size(13.dp)
                         )
-                        Spacer(modifier = Modifier.width(3.dp))
+                        Spacer(modifier = Modifier.width(4.dp))
                         Text(
                             text = if (viewModel.isSubscribed) viewModel.subscriptionTier.displayName else "Subscribe",
                             color = Color.White,
-                            fontSize = 10.5.sp,
+                            fontSize = 11.sp,
                             fontWeight = FontWeight.Bold,
                             fontFamily = FontFamily.SansSerif,
-                            maxLines = 1,
-                            softWrap = false
+                            maxLines = 1
                         )
                     }
                 }
 
-                // Attractive Save Ledger Button
+                // Save Ledger Button
                 Surface(
                     onClick = {
                         viewModel.saveLedger()
                         saveFeedbackActive = true
                     },
-                    shape = RoundedCornerShape(20.dp),
-                    color = if (saveFeedbackActive) SageGreen else SageGreen.copy(alpha = 0.25f),
-                    border = BorderStroke(1.dp, SageGreen),
-                    modifier = Modifier.testTag("save_ledger_button")
+                    modifier = Modifier
+                        .weight(1f)
+                        .testTag("save_ledger_button"),
+                    shape = RoundedCornerShape(12.dp),
+                    color = SageGreen,
+                    shadowElevation = 4.dp,
+                    tonalElevation = 2.dp,
+                    border = BorderStroke(1.dp, Color.White.copy(alpha = 0.35f))
                 ) {
                     Row(
-                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp),
+                        modifier = Modifier
+                            .background(
+                                androidx.compose.ui.graphics.Brush.verticalGradient(
+                                    colors = if (saveFeedbackActive) {
+                                        listOf(Color(0xFF10B981), Color(0xFF047857))
+                                    } else {
+                                        listOf(Color(0xFF34D399), Color(0xFF059669))
+                                    }
+                                )
+                            )
+                            .padding(vertical = 8.dp, horizontal = 6.dp),
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.Center
                     ) {
@@ -1433,21 +1663,20 @@ fun TopBarNavigation(viewModel: SecureLegacyViewModel, onExitClick: () -> Unit) 
                             imageVector = if (saveFeedbackActive) Icons.Default.Check else Icons.Default.Save,
                             contentDescription = "Save Ledger",
                             tint = Color.White,
-                            modifier = Modifier.size(12.dp)
+                            modifier = Modifier.size(13.dp)
                         )
-                        Spacer(modifier = Modifier.width(3.dp))
+                        Spacer(modifier = Modifier.width(4.dp))
                         Text(
                             text = if (saveFeedbackActive) "Saved!" else "Save",
                             color = Color.White,
-                            fontSize = 10.5.sp,
+                            fontSize = 11.sp,
                             fontWeight = FontWeight.Bold,
                             fontFamily = FontFamily.SansSerif,
-                            maxLines = 1,
-                            softWrap = false
+                            maxLines = 1
                         )
                     }
                 }
-                
+
                 if (saveFeedbackActive) {
                     LaunchedEffect(Unit) {
                         kotlinx.coroutines.delay(1500)
@@ -1455,130 +1684,117 @@ fun TopBarNavigation(viewModel: SecureLegacyViewModel, onExitClick: () -> Unit) 
                     }
                 }
 
-                // Attractive Sign Out Button
+                // Sign Out Button
                 Surface(
                     onClick = { viewModel.isLoggedIn = false },
-                    shape = RoundedCornerShape(20.dp),
-                    color = Color(0x35E53935),
-                    border = BorderStroke(1.dp, Color(0x80EF5350)),
-                    modifier = Modifier.testTag("exit_app_button")
+                    modifier = Modifier
+                        .weight(1f)
+                        .testTag("exit_app_button"),
+                    shape = RoundedCornerShape(12.dp),
+                    color = Color(0xFFDC2626),
+                    shadowElevation = 4.dp,
+                    tonalElevation = 2.dp,
+                    border = BorderStroke(1.dp, Color.White.copy(alpha = 0.35f))
                 ) {
                     Row(
-                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp),
+                        modifier = Modifier
+                            .background(
+                                androidx.compose.ui.graphics.Brush.verticalGradient(
+                                    colors = listOf(Color(0xFFEF4444), Color(0xFFB91C1C))
+                                )
+                            )
+                            .padding(vertical = 8.dp, horizontal = 6.dp),
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.Center
                     ) {
                         Icon(
                             imageVector = Icons.Default.ExitToApp,
                             contentDescription = "Sign Out",
-                            tint = Color(0xFFFF8A80),
-                            modifier = Modifier.size(12.dp)
+                            tint = Color.White,
+                            modifier = Modifier.size(13.dp)
                         )
-                        Spacer(modifier = Modifier.width(3.dp))
+                        Spacer(modifier = Modifier.width(4.dp))
                         Text(
                             text = "Sign Out",
-                            color = Color(0xFFFF8A80),
-                            fontSize = 10.5.sp,
+                            color = Color.White,
+                            fontSize = 11.sp,
                             fontWeight = FontWeight.Bold,
                             fontFamily = FontFamily.SansSerif,
-                            maxLines = 1,
-                            softWrap = false
+                            maxLines = 1
                         )
                     }
                 }
             }
-        }
 
-        Spacer(modifier = Modifier.height(12.dp))
+            Spacer(modifier = Modifier.height(14.dp))
 
-        // Organized, Attractive Navigation Segmented Tab Control Bar
-        Surface(
-            modifier = Modifier.fillMaxWidth(),
-            shape = RoundedCornerShape(14.dp),
-            color = Color(0x18FFFFFF),
-            border = BorderStroke(1.dp, Color(0x22FFFFFF))
-        ) {
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(4.dp),
-                horizontalArrangement = Arrangement.spacedBy(4.dp)
+            // Row 3: 3D Segmented Tab Control Navigation Bar
+            Surface(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(14.dp),
+                color = Color(0xFF09111E),
+                border = BorderStroke(1.dp, Color(0x33FFFFFF)),
+                shadowElevation = 6.dp
             ) {
-                Tab.values().forEach { tab ->
-                    val isActive = viewModel.currentTab == tab
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(5.dp),
+                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    Tab.values().forEach { tab ->
+                        val isActive = viewModel.currentTab == tab
 
-                    Box(
-                        modifier = Modifier
-                            .weight(1f)
-                            .clip(RoundedCornerShape(10.dp))
-                            .background(if (isActive) SageGreen else Color.Transparent)
-                            .clickable { viewModel.currentTab = tab }
-                            .padding(vertical = 8.dp)
-                            .testTag("nav_item_${tab.name.lowercase()}"),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.Center
+                        Surface(
+                            onClick = { viewModel.currentTab = tab },
+                            modifier = Modifier
+                                .weight(1f)
+                                .testTag("nav_item_${tab.name.lowercase()}"),
+                            shape = RoundedCornerShape(10.dp),
+                            color = if (isActive) SageGreen else Color.Transparent,
+                            shadowElevation = if (isActive) 6.dp else 0.dp,
+                            border = if (isActive) BorderStroke(1.dp, Color.White.copy(alpha = 0.4f)) else null
                         ) {
-                            Icon(
-                                imageVector = when (tab) {
-                                    Tab.MY_VAULT -> Icons.Outlined.FolderOpen
-                                    Tab.TRUSTED_CONTACTS -> Icons.Outlined.People
-                                    Tab.ACCESS_ACTIVITY -> Icons.Outlined.Shield
-                                },
-                                contentDescription = tab.title,
-                                tint = if (isActive) Color.White else Color.White.copy(alpha = 0.65f),
-                                modifier = Modifier.size(15.dp)
-                            )
-                            Spacer(modifier = Modifier.width(5.dp))
-                            Text(
-                                text = tab.title,
-                                color = if (isActive) Color.White else Color.White.copy(alpha = 0.8f),
-                                fontWeight = if (isActive) FontWeight.Bold else FontWeight.Medium,
-                                fontFamily = FontFamily.SansSerif,
-                                fontSize = 11.sp,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis
-                            )
+                            Row(
+                                modifier = Modifier
+                                    .then(
+                                        if (isActive) {
+                                            Modifier.background(
+                                                androidx.compose.ui.graphics.Brush.verticalGradient(
+                                                    colors = listOf(Color(0xFF34D399), Color(0xFF059669))
+                                                )
+                                            )
+                                        } else {
+                                            Modifier
+                                        }
+                                    )
+                                    .padding(vertical = 10.dp, horizontal = 2.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.Center
+                            ) {
+                                Icon(
+                                    imageVector = when (tab) {
+                                        Tab.MY_VAULT -> Icons.Outlined.FolderOpen
+                                        Tab.TRUSTED_CONTACTS -> Icons.Outlined.People
+                                        Tab.ACCESS_ACTIVITY -> Icons.Outlined.Shield
+                                    },
+                                    contentDescription = tab.title,
+                                    tint = if (isActive) Color.White else Color.White.copy(alpha = 0.65f),
+                                    modifier = Modifier.size(15.dp)
+                                )
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text(
+                                    text = tab.title,
+                                    color = if (isActive) Color.White else Color.White.copy(alpha = 0.75f),
+                                    fontWeight = if (isActive) FontWeight.ExtraBold else FontWeight.Medium,
+                                    fontFamily = FontFamily.SansSerif,
+                                    fontSize = 11.sp,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
                         }
                     }
-                }
-            }
-        }
-
-        Spacer(modifier = Modifier.height(8.dp))
-
-        // Status Row (Subtle & Elegant status indication)
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Text(
-                text = "SECURE DIGITAL HERITAGE LEDGER",
-                color = Color.White.copy(alpha = 0.4f),
-                fontSize = 8.sp,
-                fontWeight = FontWeight.Bold,
-                fontFamily = FontFamily.SansSerif,
-                letterSpacing = 0.05.sp
-            )
-
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(
-                    text = "VAULT STATUS: ",
-                    color = Color.White.copy(alpha = 0.4f),
-                    fontSize = 8.sp,
-                    fontWeight = FontWeight.Bold,
-                    fontFamily = FontFamily.SansSerif
-                )
-                Spacer(modifier = Modifier.width(4.dp))
-                when (viewModel.accessStatus) {
-                    AccessStatus.NO_REQUEST -> StampedLabel(text = "Secured", color = SageGreen)
-                    AccessStatus.GRACE_PERIOD -> StampedLabel(text = "Grace Period", color = MutedAmber)
-                    AccessStatus.AWAITING_SECOND_CONFIRMATION -> StampedLabel(text = "Pending Confirmation", color = MutedAmber)
-                    AccessStatus.UNLOCKED -> StampedLabel(text = "Unlocked", color = SageGreen)
-                    AccessStatus.CANCELLED -> StampedLabel(text = "Cancelled", color = MutedRed)
                 }
             }
         }
@@ -1913,6 +2129,98 @@ fun MyVaultScreen(viewModel: SecureLegacyViewModel) {
                 .verticalScroll(scrollState),
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
+            // Home Page Subscription Option Banner
+            var showSubDialogInVault by remember { mutableStateOf(false) }
+            if (showSubDialogInVault) {
+                SubscriptionPaymentDialog(viewModel = viewModel, onDismiss = { showSubDialogInVault = false })
+            }
+
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable { showSubDialogInVault = true }
+                    .testTag("home_subscription_banner"),
+                colors = CardDefaults.cardColors(
+                    containerColor = if (viewModel.subscriptionTier == SubscriptionTier.LIFETIME_PACK) Color(0xFF1E1B4B) else Color(0xFF0F291E)
+                ),
+                shape = RoundedCornerShape(16.dp),
+                border = BorderStroke(1.5.dp, if (viewModel.subscriptionTier == SubscriptionTier.LIFETIME_PACK) Color(0xFF8B5CF6) else SageGreen)
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(14.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Surface(
+                            shape = CircleShape,
+                            color = if (viewModel.subscriptionTier == SubscriptionTier.LIFETIME_PACK) Color(0xFF8B5CF6).copy(alpha = 0.2f) else SageGreen.copy(alpha = 0.2f),
+                            modifier = Modifier.size(38.dp)
+                        ) {
+                            Box(contentAlignment = Alignment.Center) {
+                                Icon(
+                                    imageVector = Icons.Default.Star,
+                                    contentDescription = null,
+                                    tint = if (viewModel.subscriptionTier == SubscriptionTier.LIFETIME_PACK) Color(0xFFA78BFA) else SageGreen,
+                                    modifier = Modifier.size(20.dp)
+                                )
+                            }
+                        }
+                        Column {
+                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                Text(
+                                    text = "Plan: ${viewModel.subscriptionTier.displayName}",
+                                    color = Color.White,
+                                    fontSize = 13.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    fontFamily = FontFamily.Serif
+                                )
+                                Surface(
+                                    shape = RoundedCornerShape(6.dp),
+                                    color = if (viewModel.subscriptionTier == SubscriptionTier.LIFETIME_PACK) Color(0xFF8B5CF6) else SageGreen
+                                ) {
+                                    Text(
+                                        text = viewModel.subscriptionTier.priceText,
+                                        color = Color.White,
+                                        fontSize = 10.sp,
+                                        fontWeight = FontWeight.ExtraBold,
+                                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                    )
+                                }
+                            }
+                            Text(
+                                text = "30 Days Free Trial or Lifetime Pack (₹499) • Tap to Subscribe",
+                                color = Color(0xFF94A3B8),
+                                fontSize = 11.sp,
+                                fontFamily = FontFamily.SansSerif
+                            )
+                        }
+                    }
+
+                    Button(
+                        onClick = { showSubDialogInVault = true },
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = if (viewModel.subscriptionTier == SubscriptionTier.LIFETIME_PACK) Color(0xFF8B5CF6) else SageGreen
+                        ),
+                        shape = RoundedCornerShape(10.dp),
+                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+                    ) {
+                        Text(
+                            text = if (viewModel.subscriptionTier == SubscriptionTier.LIFETIME_PACK) "Manage" else "Subscribe",
+                            color = Color.White,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                }
+            }
+
             // Category list
             VaultCategory.values().forEach { category ->
                 val isCategoryUnlocked = when (category) {
@@ -2022,10 +2330,26 @@ fun CategorySectionCard(
     Card(
         modifier = Modifier
             .fillMaxWidth()
-            .border(BorderStroke(1.dp, CardBorder), RoundedCornerShape(16.dp)),
+            .shadow(
+                elevation = 10.dp,
+                shape = RoundedCornerShape(18.dp),
+                spotColor = categoryColor.copy(alpha = 0.5f)
+            )
+            .border(
+                border = BorderStroke(
+                    1.5.dp,
+                    androidx.compose.ui.graphics.Brush.verticalGradient(
+                        colors = listOf(
+                            categoryColor.copy(alpha = 0.8f),
+                            CardBorder
+                        )
+                    )
+                ),
+                shape = RoundedCornerShape(18.dp)
+            ),
         colors = CardDefaults.cardColors(containerColor = WarmCard),
-        elevation = CardDefaults.cardElevation(8.dp),
-        shape = RoundedCornerShape(16.dp)
+        elevation = CardDefaults.cardElevation(10.dp),
+        shape = RoundedCornerShape(18.dp)
     ) {
         Column(modifier = Modifier.padding(16.dp)) {
             // Category Header
@@ -2445,7 +2769,17 @@ fun UploadDocumentDialog(
     onDismiss: () -> Unit,
     onUpload: (documentName: String) -> Unit
 ) {
+    val context = LocalContext.current
     var docName by remember { mutableStateOf("") }
+    val uploadPicker = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.GetContent()
+    ) { uri: Uri? ->
+        uri?.let { selectedUri ->
+            val name = getFileNameFromUri(context, selectedUri) ?: "Document.pdf"
+            docName = name
+        }
+    }
+
     val recommendedDocs = when (item.category) {
         VaultCategory.EMERGENCY -> listOf("ID_Proof.pdf", "Authorization_Letter.pdf", "Agreement_Signed.pdf")
         VaultCategory.BANKING -> listOf("Bank_Statement.pdf", "Cancelled_Cheque.pdf", "Passbook_Scan.pdf")
@@ -2486,6 +2820,39 @@ fun UploadDocumentDialog(
                     fontFamily = FontFamily.SansSerif
                 )
                 Spacer(modifier = Modifier.height(16.dp))
+
+                // 3D Device File Picker Button
+                Surface(
+                    onClick = { uploadPicker.launch("*/*") },
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(10.dp),
+                    color = Color(0xFF1E293B),
+                    shadowElevation = 4.dp,
+                    border = BorderStroke(1.dp, SageGreen)
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.Center
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.UploadFile,
+                            contentDescription = "Browse Device Files",
+                            tint = SageGreen,
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = "Browse & Choose File from Device",
+                            color = Color.White,
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 12.sp,
+                            fontFamily = FontFamily.SansSerif
+                        )
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(12.dp))
 
                 Text(
                     text = "DOCUMENT NAME",
@@ -2678,11 +3045,26 @@ fun AddOrEditVaultItemDialog(
     onSave: (title: String, detail: String, category: VaultCategory, contactType: String?, assetType: String?, uploadedDocuments: List<String>) -> Unit,
     onDelete: (() -> Unit)? = null
 ) {
+    val context = LocalContext.current
     var title by remember { mutableStateOf(existingItem?.title ?: "") }
     var detail by remember { mutableStateOf(existingItem?.detail ?: "") }
     var selectedContactType by remember { mutableStateOf(existingItem?.contactType ?: "CA") }
+    var contactDropdownExpanded by remember { mutableStateOf(false) }
     var documentInput by remember { mutableStateOf("") }
     var attachedDocuments by remember { mutableStateOf(existingItem?.uploadedDocuments ?: listOf()) }
+
+    // Native device file picker launcher
+    val documentPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.GetContent()
+    ) { uri: Uri? ->
+        uri?.let { selectedUri ->
+            val fileName = getFileNameFromUri(context, selectedUri)
+                ?: "Attached_Doc_${System.currentTimeMillis().toString().takeLast(4)}.pdf"
+            if (!attachedDocuments.contains(fileName)) {
+                attachedDocuments = attachedDocuments + fileName
+            }
+        }
+    }
 
     val category = existingItem?.category ?: initialCategory
 
@@ -2772,6 +3154,7 @@ fun AddOrEditVaultItemDialog(
 
                 Spacer(modifier = Modifier.height(16.dp))
 
+                // Important Contacts Dropdown (CA, Lawyer, Insurance Agent, RM, Others as last option)
                 if (category == VaultCategory.EMERGENCY) {
                     Text(
                         text = "CONTACT DESIGNATION",
@@ -2781,28 +3164,88 @@ fun AddOrEditVaultItemDialog(
                         fontFamily = FontFamily.SansSerif
                     )
                     Spacer(modifier = Modifier.height(6.dp))
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(6.dp)
-                    ) {
-                        listOf("CA", "Lawyer", "Insurance Agent", "Bank RM").forEach { cType ->
-                            val isSelected = selectedContactType == cType
-                            Surface(
-                                onClick = { selectedContactType = cType },
-                                shape = RoundedCornerShape(6.dp),
-                                color = if (isSelected) SageGreen else Color.White,
-                                border = BorderStroke(1.dp, if (isSelected) SageGreen else CardBorder)
+
+                    val contactOptions = listOf("CA", "Lawyer", "Insurance Agent", "RM", "Others")
+
+                    Box(modifier = Modifier.fillMaxWidth()) {
+                        OutlinedCard(
+                            onClick = { contactDropdownExpanded = true },
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(8.dp),
+                            colors = CardDefaults.outlinedCardColors(containerColor = Color.White),
+                            border = BorderStroke(1.dp, SageGreen)
+                        ) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 12.dp, vertical = 10.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
                             ) {
-                                Text(
-                                    text = cType,
-                                    fontSize = 10.sp,
-                                    fontWeight = FontWeight.Bold,
-                                    color = if (isSelected) Color.White else TextDark,
-                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp)
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Icon(
+                                        imageVector = Icons.Default.Badge,
+                                        contentDescription = "Contact Role",
+                                        tint = SageGreen,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Text(
+                                        text = if (selectedContactType.isNotEmpty()) selectedContactType else "Select Designation",
+                                        color = TextDark,
+                                        fontWeight = FontWeight.Bold,
+                                        fontSize = 13.sp,
+                                        fontFamily = FontFamily.SansSerif
+                                    )
+                                }
+                                Icon(
+                                    imageVector = Icons.Default.ArrowDropDown,
+                                    contentDescription = "Dropdown arrow",
+                                    tint = TextMuted
+                                )
+                            }
+                        }
+
+                        DropdownMenu(
+                            expanded = contactDropdownExpanded,
+                            onDismissRequest = { contactDropdownExpanded = false },
+                            modifier = Modifier
+                                .fillMaxWidth(0.85f)
+                                .background(Color.White)
+                        ) {
+                            contactOptions.forEach { option ->
+                                DropdownMenuItem(
+                                    text = {
+                                        Text(
+                                            text = option,
+                                            fontWeight = if (selectedContactType == option) FontWeight.Bold else FontWeight.Normal,
+                                            color = if (selectedContactType == option) SageGreen else TextDark,
+                                            fontSize = 13.sp
+                                        )
+                                    },
+                                    onClick = {
+                                        selectedContactType = option
+                                        contactDropdownExpanded = false
+                                    },
+                                    leadingIcon = {
+                                        Icon(
+                                            imageVector = when (option) {
+                                                "CA" -> Icons.Default.AccountBalance
+                                                "Lawyer" -> Icons.Default.Gavel
+                                                "Insurance Agent" -> Icons.Default.Security
+                                                "RM" -> Icons.Default.SupportAgent
+                                                else -> Icons.Default.Person
+                                            },
+                                            contentDescription = option,
+                                            tint = SageGreen,
+                                            modifier = Modifier.size(18.dp)
+                                        )
+                                    }
                                 )
                             }
                         }
                     }
+
                     Spacer(modifier = Modifier.height(16.dp))
                 }
 
@@ -2859,15 +3302,49 @@ fun AddOrEditVaultItemDialog(
 
                 Spacer(modifier = Modifier.height(16.dp))
 
-                // Optional Document Names
+                // Document Attachment Section with 3D Device File Picker
                 Text(
-                    text = "ATTACHED DOCUMENTS",
+                    text = "ATTACH DOCUMENTS / FILES",
                     fontSize = 10.sp,
                     fontWeight = FontWeight.Bold,
                     color = TextMuted,
                     fontFamily = FontFamily.SansSerif
                 )
-                Spacer(modifier = Modifier.height(4.dp))
+                Spacer(modifier = Modifier.height(6.dp))
+
+                Surface(
+                    onClick = { documentPickerLauncher.launch("*/*") },
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(10.dp),
+                    color = Color(0xFF1E293B),
+                    shadowElevation = 4.dp,
+                    border = BorderStroke(1.dp, SageGreen)
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .padding(horizontal = 14.dp, vertical = 12.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.Center
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.AttachFile,
+                            contentDescription = "Attach Document",
+                            tint = SageGreen,
+                            modifier = Modifier.size(20.dp)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = "Browse & Attach Document / File",
+                            color = Color.White,
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 12.sp,
+                            fontFamily = FontFamily.SansSerif
+                        )
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(8.dp))
+
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically
@@ -2980,19 +3457,22 @@ fun AddOrEditVaultItemDialog(
 @Composable
 fun SubscriptionPaymentDialog(viewModel: SecureLegacyViewModel, onDismiss: () -> Unit) {
     val context = androidx.compose.ui.platform.LocalContext.current
-    var selectedPlan by remember { mutableStateOf(if (viewModel.subscriptionTier != SubscriptionTier.FREE) viewModel.subscriptionTier else SubscriptionTier.ANNUAL_PRO) }
+    var selectedPlan by remember { mutableStateOf(viewModel.subscriptionTier) }
     var selectedPaymentMethod by remember { mutableStateOf("UPI") } // "UPI", "CARD", "NETBANKING"
     
     var upiId by remember { mutableStateOf("user@okhdfcbank") }
+    var upiPin by remember { mutableStateOf("8492") }
     var selectedUpiApp by remember { mutableStateOf("Google Pay") }
     
     var cardNumber by remember { mutableStateOf("4532 8921 7843 9012") }
     var cardExpiry by remember { mutableStateOf("12/28") }
     var cardCvv by remember { mutableStateOf("882") }
     var cardHolder by remember { mutableStateOf(viewModel.registeredUsername.ifEmpty { "Amanat Vault Owner" }) }
+    var otpCode by remember { mutableStateOf("582910") }
     
     var selectedBank by remember { mutableStateOf("HDFC Bank") }
     
+    var showPaymentGateway by remember { mutableStateOf(false) }
     var isProcessing by remember { mutableStateOf(false) }
     var showReceipt by remember { mutableStateOf(false) }
     var activeTxId by remember { mutableStateOf("") }
@@ -3047,14 +3527,14 @@ fun SubscriptionPaymentDialog(viewModel: SecureLegacyViewModel, onDismiss: () ->
                         }
                         Column {
                             Text(
-                                text = "Amanat Heritage Subscription",
+                                text = "Amanat Vault Protection Plans",
                                 color = Color.White,
                                 fontSize = 16.sp,
                                 fontWeight = FontWeight.Bold,
                                 fontFamily = FontFamily.Serif
                             )
                             Text(
-                                text = "Encrypted Vault & Priority Emergency Protection",
+                                text = "Choose your protection tier & payment method",
                                 color = Color(0xFF94A3B8),
                                 fontSize = 11.sp,
                                 fontFamily = FontFamily.SansSerif
@@ -3111,7 +3591,7 @@ fun SubscriptionPaymentDialog(viewModel: SecureLegacyViewModel, onDismiss: () ->
                         Spacer(modifier = Modifier.height(16.dp))
 
                         Text(
-                            text = "Payment Successful!",
+                            text = if (selectedPlan == SubscriptionTier.FREE_TRIAL) "Free Trial Activated!" else "Payment Successful!",
                             color = Color.White,
                             fontSize = 20.sp,
                             fontWeight = FontWeight.Bold,
@@ -3119,7 +3599,7 @@ fun SubscriptionPaymentDialog(viewModel: SecureLegacyViewModel, onDismiss: () ->
                         )
 
                         Text(
-                            text = "Your Amanat Heritage Subscription is now Active",
+                            text = "Your Amanat Vault Subscription is now Active",
                             color = SageGreen,
                             fontSize = 13.sp,
                             fontWeight = FontWeight.SemiBold,
@@ -3137,7 +3617,7 @@ fun SubscriptionPaymentDialog(viewModel: SecureLegacyViewModel, onDismiss: () ->
                         ) {
                             Column(modifier = Modifier.padding(18.dp)) {
                                 Text(
-                                    text = "OFFICIAL PAYMENT RECEIPT",
+                                    text = "OFFICIAL PLAN RECEIPT",
                                     color = Color(0xFF94A3B8),
                                     fontSize = 11.sp,
                                     fontWeight = FontWeight.ExtraBold,
@@ -3181,7 +3661,12 @@ fun SubscriptionPaymentDialog(viewModel: SecureLegacyViewModel, onDismiss: () ->
                                     horizontalArrangement = Arrangement.SpaceBetween
                                 ) {
                                     Text(text = "Payment Method", color = Color(0xFF94A3B8), fontSize = 12.sp)
-                                    Text(text = "$selectedPaymentMethod ($selectedUpiApp)", color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Medium)
+                                    Text(
+                                        text = if (selectedPlan == SubscriptionTier.FREE_TRIAL) "Direct Activation (No Payment)" else "$selectedPaymentMethod ($selectedUpiApp)",
+                                        color = Color.White,
+                                        fontSize = 12.sp,
+                                        fontWeight = FontWeight.Medium
+                                    )
                                 }
 
                                 HorizontalDivider(color = Color(0xFF334155), modifier = Modifier.padding(vertical = 10.dp))
@@ -3190,7 +3675,7 @@ fun SubscriptionPaymentDialog(viewModel: SecureLegacyViewModel, onDismiss: () ->
                                     modifier = Modifier.fillMaxWidth(),
                                     horizontalArrangement = Arrangement.SpaceBetween
                                 ) {
-                                    Text(text = "Status / Validity", color = Color(0xFF94A3B8), fontSize = 12.sp)
+                                    Text(text = "Status / Expiry", color = Color(0xFF94A3B8), fontSize = 12.sp)
                                     Text(text = viewModel.subscriptionExpiryDate, color = Color(0xFFFBBF24), fontSize = 12.sp, fontWeight = FontWeight.Bold)
                                 }
                             }
@@ -3213,34 +3698,192 @@ fun SubscriptionPaymentDialog(viewModel: SecureLegacyViewModel, onDismiss: () ->
                             )
                         }
                     }
-                } else if (isProcessing) {
-                    // PROCESSING VIEW
+                } else if (showPaymentGateway) {
+                    // INTERACTIVE PAYMENT GATEWAY SIMULATION
                     Column(
                         modifier = Modifier
                             .weight(1f)
-                            .fillMaxWidth(),
-                        horizontalAlignment = Alignment.CenterHorizontally,
-                        verticalArrangement = Arrangement.Center
+                            .fillMaxWidth()
+                            .verticalScroll(rememberScrollState()),
+                        verticalArrangement = Arrangement.spacedBy(16.dp)
                     ) {
-                        CircularProgressIndicator(
-                            color = SageGreen,
-                            strokeWidth = 4.dp,
-                            modifier = Modifier.size(52.dp)
-                        )
-                        Spacer(modifier = Modifier.height(20.dp))
-                        Text(
-                            text = "Securing Encrypted Escrow Gateway...",
-                            color = Color.White,
-                            fontSize = 16.sp,
-                            fontWeight = FontWeight.Bold
-                        )
-                        Spacer(modifier = Modifier.height(8.dp))
-                        Text(
-                            text = "Verifying payment with bank & configuring digital estate ledger...",
-                            color = Color(0xFF94A3B8),
-                            fontSize = 12.sp,
-                            textAlign = TextAlign.Center
-                        )
+                        Surface(
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(12.dp),
+                            color = Color(0xFF1E293B),
+                            border = BorderStroke(1.dp, SageGreen.copy(alpha = 0.5f))
+                        ) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(12.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column {
+                                    Text(text = "Order Summary", color = Color(0xFF94A3B8), fontSize = 11.sp)
+                                    Text(text = "${selectedPlan.displayName} (${selectedPlan.priceText})", color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                                }
+                                Surface(shape = RoundedCornerShape(6.dp), color = SageGreen) {
+                                    Text("Pay ${selectedPlan.priceText}", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp))
+                                }
+                            }
+                        }
+
+                        if (isProcessing) {
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(vertical = 40.dp),
+                                horizontalAlignment = Alignment.CenterHorizontally
+                            ) {
+                                CircularProgressIndicator(color = SageGreen, strokeWidth = 4.dp, modifier = Modifier.size(48.dp))
+                                Spacer(modifier = Modifier.height(20.dp))
+                                Text(text = "Verifying Payment with NPCI & Bank...", color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.Bold)
+                                Spacer(modifier = Modifier.height(8.dp))
+                                Text(text = "Please do not close or press back. Encrypted gateway connecting...", color = Color(0xFF94A3B8), fontSize = 12.sp, textAlign = TextAlign.Center)
+                            }
+                        } else {
+                            Text(
+                                text = "SECURE PAYMENT AUTHORIZATION",
+                                color = Color(0xFFFBBF24),
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.ExtraBold,
+                                letterSpacing = 1.sp
+                            )
+
+                            when (selectedPaymentMethod) {
+                                "UPI" -> {
+                                    Card(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        colors = CardDefaults.cardColors(containerColor = Color(0xFF1E293B)),
+                                        shape = RoundedCornerShape(14.dp),
+                                        border = BorderStroke(1.dp, Color(0xFF334155))
+                                    ) {
+                                        Column(modifier = Modifier.padding(16.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                                            Text(text = "Scan QR or Enter UPI PIN for $selectedUpiApp", color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                                            Spacer(modifier = Modifier.height(12.dp))
+
+                                            Box(
+                                                modifier = Modifier
+                                                    .size(130.dp)
+                                                    .clip(RoundedCornerShape(12.dp))
+                                                    .background(Color.White)
+                                                    .padding(10.dp),
+                                                contentAlignment = Alignment.Center
+                                            ) {
+                                                Icon(imageVector = Icons.Default.QrCode, contentDescription = "UPI QR Code", tint = Color.Black, modifier = Modifier.fillMaxSize())
+                                            }
+
+                                            Spacer(modifier = Modifier.height(8.dp))
+                                            Text(text = "UPI ID: $upiId", color = Color(0xFF94A3B8), fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+
+                                            Spacer(modifier = Modifier.height(14.dp))
+
+                                            OutlinedTextField(
+                                                value = upiPin,
+                                                onValueChange = { if (it.length <= 6) upiPin = it },
+                                                label = { Text("Enter 4 or 6-Digit UPI PIN", color = Color(0xFF94A3B8), fontSize = 11.sp) },
+                                                modifier = Modifier.fillMaxWidth(),
+                                                visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation(),
+                                                textStyle = androidx.compose.ui.text.TextStyle(color = Color.White, fontSize = 16.sp, fontFamily = FontFamily.Monospace, textAlign = TextAlign.Center),
+                                                colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = SageGreen, unfocusedBorderColor = Color(0xFF334155)),
+                                                shape = RoundedCornerShape(10.dp),
+                                                singleLine = true
+                                            )
+                                        }
+                                    }
+                                }
+
+                                "CARD" -> {
+                                    Card(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        colors = CardDefaults.cardColors(containerColor = Color(0xFF1E293B)),
+                                        shape = RoundedCornerShape(14.dp),
+                                        border = BorderStroke(1.dp, Color(0xFF334155))
+                                    ) {
+                                        Column(modifier = Modifier.padding(16.dp)) {
+                                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                                Icon(imageVector = Icons.Default.CreditCard, contentDescription = null, tint = SageGreen)
+                                                Text(text = "Bank 3D-Secure OTP Verification", color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                                            }
+
+                                            Spacer(modifier = Modifier.height(8.dp))
+                                            Text(text = "A 6-digit SMS OTP was sent to phone registered with card $cardNumber.", color = Color(0xFF94A3B8), fontSize = 11.sp)
+
+                                            Spacer(modifier = Modifier.height(14.dp))
+
+                                            OutlinedTextField(
+                                                value = otpCode,
+                                                onValueChange = { if (it.length <= 6) otpCode = it },
+                                                label = { Text("Enter 6-Digit Bank OTP", color = Color(0xFF94A3B8), fontSize = 11.sp) },
+                                                modifier = Modifier.fillMaxWidth(),
+                                                textStyle = androidx.compose.ui.text.TextStyle(color = Color.White, fontSize = 16.sp, fontFamily = FontFamily.Monospace, textAlign = TextAlign.Center),
+                                                colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = SageGreen, unfocusedBorderColor = Color(0xFF334155)),
+                                                shape = RoundedCornerShape(10.dp),
+                                                singleLine = true
+                                            )
+                                        }
+                                    }
+                                }
+
+                                "NETBANKING" -> {
+                                    Card(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        colors = CardDefaults.cardColors(containerColor = Color(0xFF1E293B)),
+                                        shape = RoundedCornerShape(14.dp),
+                                        border = BorderStroke(1.dp, Color(0xFF334155))
+                                    ) {
+                                        Column(modifier = Modifier.padding(16.dp)) {
+                                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                                Icon(imageVector = Icons.Default.AccountBalance, contentDescription = null, tint = SageGreen)
+                                                Text(text = "$selectedBank Net Banking Portal", color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                                            }
+
+                                            Spacer(modifier = Modifier.height(12.dp))
+                                            Text(text = "Connected to $selectedBank secure authorization gateway.", color = Color(0xFF94A3B8), fontSize = 11.sp)
+                                            Spacer(modifier = Modifier.height(8.dp))
+                                            Text(text = "Account Holder: ${cardHolder.ifEmpty { "Amanat Vault User" }}", color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                                            Text(text = "Total Amount to Debit: ₹499", color = SageGreen, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                                        }
+                                    }
+                                }
+                            }
+
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(10.dp)
+                            ) {
+                                OutlinedButton(
+                                    onClick = { showPaymentGateway = false },
+                                    modifier = Modifier.weight(1f),
+                                    colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.White),
+                                    border = BorderStroke(1.dp, Color(0xFF334155)),
+                                    shape = RoundedCornerShape(12.dp)
+                                ) {
+                                    Text("Back", fontSize = 13.sp)
+                                }
+
+                                Button(
+                                    onClick = {
+                                        isProcessing = true
+                                        coroutineScope.launch {
+                                            kotlinx.coroutines.delay(1800)
+                                            val txId = viewModel.subscribeToPlan(selectedPlan, selectedPaymentMethod)
+                                            activeTxId = txId
+                                            isProcessing = false
+                                            showPaymentGateway = false
+                                            showReceipt = true
+                                        }
+                                    },
+                                    modifier = Modifier.weight(2f),
+                                    colors = ButtonDefaults.buttonColors(containerColor = SageGreen),
+                                    shape = RoundedCornerShape(12.dp)
+                                ) {
+                                    Text("Authorize & Pay ₹499", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                                }
+                            }
+                        }
                     }
                 } else {
                     // SELECTION & FORM VIEW
@@ -3277,7 +3920,7 @@ fun SubscriptionPaymentDialog(viewModel: SecureLegacyViewModel, onDismiss: () ->
                                                 modifier = Modifier.size(16.dp)
                                             )
                                             Text(
-                                                text = "Current Active Subscription",
+                                                text = "Current Active Plan",
                                                 color = SageGreen,
                                                 fontSize = 11.sp,
                                                 fontWeight = FontWeight.Bold
@@ -3290,7 +3933,7 @@ fun SubscriptionPaymentDialog(viewModel: SecureLegacyViewModel, onDismiss: () ->
                                             fontWeight = FontWeight.Bold
                                         )
                                         Text(
-                                            text = "Valid till: ${viewModel.subscriptionExpiryDate} • Tx ID: ${viewModel.subscriptionTransactionId}",
+                                            text = "${viewModel.subscriptionExpiryDate} • Tx ID: ${viewModel.subscriptionTransactionId}",
                                             color = Color(0xFF94A3B8),
                                             fontSize = 10.sp
                                         )
@@ -3299,14 +3942,14 @@ fun SubscriptionPaymentDialog(viewModel: SecureLegacyViewModel, onDismiss: () ->
                                     OutlinedButton(
                                         onClick = {
                                             viewModel.cancelSubscription()
-                                            Toast.makeText(context, "Subscription canceled", Toast.LENGTH_SHORT).show()
+                                            Toast.makeText(context, "Subscription reset to trial", Toast.LENGTH_SHORT).show()
                                         },
                                         colors = ButtonDefaults.outlinedButtonColors(contentColor = MutedRed),
                                         border = BorderStroke(1.dp, MutedRed.copy(alpha = 0.5f)),
                                         contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp),
                                         shape = RoundedCornerShape(8.dp)
                                     ) {
-                                        Text("Cancel", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                                        Text("Reset", fontSize = 11.sp, fontWeight = FontWeight.Bold)
                                     }
                                 }
                             }
@@ -3314,59 +3957,46 @@ fun SubscriptionPaymentDialog(viewModel: SecureLegacyViewModel, onDismiss: () ->
 
                         // STEP 1: SELECT PLAN
                         Text(
-                            text = "1. CHOOSE YOUR PROTECTION PLAN",
+                            text = "1. CHOOSE YOUR SUBSCRIPTION OPTION",
                             color = Color(0xFFFBBF24),
                             fontSize = 11.sp,
                             fontWeight = FontWeight.ExtraBold,
                             letterSpacing = 1.sp
                         )
 
-                        // Plan 1: Amanat Pro (Annual)
+                        // Option 1: 30 Days Free Trial
                         PlanOptionCard(
-                            tier = SubscriptionTier.ANNUAL_PRO,
-                            tagText = "MOST POPULAR",
+                            tier = SubscriptionTier.FREE_TRIAL,
+                            tagText = "30 DAYS FREE",
                             features = listOf(
-                                "Unlimited Digital Vault Asset Items",
-                                "Priority Emergency Protocol Dispatch",
-                                "Biometric Multi-Factor Escrow",
-                                "Encrypted Cloud Sync & PDF Export"
-                            ),
-                            isSelected = selectedPlan == SubscriptionTier.ANNUAL_PRO,
-                            onSelect = { selectedPlan = SubscriptionTier.ANNUAL_PRO }
-                        )
-
-                        // Plan 2: Family Heritage (Lifetime)
-                        PlanOptionCard(
-                            tier = SubscriptionTier.LIFETIME_HERITAGE,
-                            tagText = "BEST VALUE",
-                            features = listOf(
-                                "Everything in Pro + Up to 5 Family Accounts",
-                                "Dedicated Legal Executor Portal",
-                                "Physical Security Escrow Box Option",
-                                "24/7 Priority Heritage Hotline Support"
-                            ),
-                            isSelected = selectedPlan == SubscriptionTier.LIFETIME_HERITAGE,
-                            onSelect = { selectedPlan = SubscriptionTier.LIFETIME_HERITAGE }
-                        )
-
-                        // Plan 3: Free
-                        PlanOptionCard(
-                            tier = SubscriptionTier.FREE,
-                            tagText = "BASIC",
-                            features = listOf(
-                                "Basic Vault Storage (up to 5 assets)",
-                                "Max 2 Trusted Contacts",
+                                "30 Days Free Trial Access",
+                                "Basic Vault Storage across all categories",
+                                "Add up to 2 Trusted Contacts",
                                 "Standard Grace Period Protocol"
                             ),
-                            isSelected = selectedPlan == SubscriptionTier.FREE,
-                            onSelect = { selectedPlan = SubscriptionTier.FREE }
+                            isSelected = selectedPlan == SubscriptionTier.FREE_TRIAL,
+                            onSelect = { selectedPlan = SubscriptionTier.FREE_TRIAL }
                         )
 
-                        if (selectedPlan != SubscriptionTier.FREE) {
+                        // Option 2: Lifetime Pack for 499
+                        PlanOptionCard(
+                            tier = SubscriptionTier.LIFETIME_PACK,
+                            tagText = "BEST VALUE • ₹499",
+                            features = listOf(
+                                "Lifetime Access — Pay Once (₹499), No Monthly Fees",
+                                "Unlimited Digital Vault Assets & Document Attachments",
+                                "Priority Emergency Protocol & Legal Executor Portal",
+                                "Encrypted Cloud Sync & Dedicated Support"
+                            ),
+                            isSelected = selectedPlan == SubscriptionTier.LIFETIME_PACK,
+                            onSelect = { selectedPlan = SubscriptionTier.LIFETIME_PACK }
+                        )
+
+                        if (selectedPlan == SubscriptionTier.LIFETIME_PACK) {
                             // STEP 2: PAYMENT METHOD
                             Spacer(modifier = Modifier.height(6.dp))
                             Text(
-                                text = "2. SELECT PAYMENT METHOD",
+                                text = "2. SELECT PAYMENT METHOD FOR ₹499",
                                 color = SageGreen,
                                 fontSize = 11.sp,
                                 fontWeight = FontWeight.ExtraBold,
@@ -3412,7 +4042,7 @@ fun SubscriptionPaymentDialog(viewModel: SecureLegacyViewModel, onDismiss: () ->
                                     when (selectedPaymentMethod) {
                                         "UPI" -> {
                                             Text(
-                                                text = "Select Preferred UPI App or Enter Virtual Payment Address (VPA):",
+                                                text = "Select Preferred UPI App & Enter VPA:",
                                                 color = Color.White,
                                                 fontSize = 12.sp,
                                                 fontWeight = FontWeight.Bold
@@ -3564,30 +4194,24 @@ fun SubscriptionPaymentDialog(viewModel: SecureLegacyViewModel, onDismiss: () ->
                     Spacer(modifier = Modifier.height(14.dp))
 
                     // ACTION BUTTON
-                    if (selectedPlan == SubscriptionTier.FREE) {
+                    if (selectedPlan == SubscriptionTier.FREE_TRIAL) {
                         Button(
                             onClick = {
-                                viewModel.subscribeToPlan(SubscriptionTier.FREE, "None")
-                                Toast.makeText(context, "Switched to Free Plan", Toast.LENGTH_SHORT).show()
-                                onDismiss()
+                                val txId = viewModel.subscribeToPlan(SubscriptionTier.FREE_TRIAL, "Direct Activation")
+                                activeTxId = txId
+                                showReceipt = true
+                                Toast.makeText(context, "30-Day Free Trial Activated!", Toast.LENGTH_SHORT).show()
                             },
                             modifier = Modifier.fillMaxWidth(),
-                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF334155)),
+                            colors = ButtonDefaults.buttonColors(containerColor = SageGreen),
                             shape = RoundedCornerShape(12.dp)
                         ) {
-                            Text("Continue with Free Plan", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                            Text("Activate 30 Days Free Trial (₹0)", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 14.sp)
                         }
                     } else {
                         Button(
                             onClick = {
-                                isProcessing = true
-                                coroutineScope.launch {
-                                    kotlinx.coroutines.delay(1500)
-                                    val txId = viewModel.subscribeToPlan(selectedPlan, selectedPaymentMethod)
-                                    activeTxId = txId
-                                    isProcessing = false
-                                    showReceipt = true
-                                }
+                                showPaymentGateway = true
                             },
                             modifier = Modifier.fillMaxWidth(),
                             colors = ButtonDefaults.buttonColors(containerColor = SageGreen),
@@ -3599,7 +4223,7 @@ fun SubscriptionPaymentDialog(viewModel: SecureLegacyViewModel, onDismiss: () ->
                             ) {
                                 Icon(imageVector = Icons.Default.Lock, contentDescription = null, tint = Color.White, modifier = Modifier.size(18.dp))
                                 Text(
-                                    text = "Pay ${selectedPlan.priceText} & Activate ${selectedPlan.displayName}",
+                                    text = "Proceed to Pay ₹499 & Get Lifetime Pack",
                                     color = Color.White,
                                     fontWeight = FontWeight.Bold,
                                     fontSize = 14.sp
@@ -4161,6 +4785,37 @@ fun TrustedContactsScreen(viewModel: SecureLegacyViewModel) {
             .padding(bottom = 24.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp)
     ) {
+        // Navigation Back to Home Button
+        Surface(
+            onClick = { viewModel.selectTab(Tab.MY_VAULT) },
+            modifier = Modifier
+                .fillMaxWidth()
+                .testTag("back_to_home_button_trusted_contacts"),
+            shape = RoundedCornerShape(12.dp),
+            color = Color(0xFF1E293B),
+            border = BorderStroke(1.dp, SageGreen.copy(alpha = 0.5f))
+        ) {
+            Row(
+                modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Icon(
+                    imageVector = Icons.Default.ArrowBack,
+                    contentDescription = "Back to Home",
+                    tint = SageGreen,
+                    modifier = Modifier.size(18.dp)
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(
+                    text = "Back to Home Page (My Amanat)",
+                    color = Color.White,
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.Bold,
+                    fontFamily = FontFamily.SansSerif
+                )
+            }
+        }
+
         // Description Banner
         Surface(
             modifier = Modifier.fillMaxWidth(),
@@ -4353,7 +5008,7 @@ fun TrustedContactSlotCard(
                     )
                 ) {
                     Text(
-                        text = if (hasContact) "CONFIGURED" else "EMPTY SLOT",
+                        text = if (hasContact) "CONFIGURED" else "READY TO CONFIGURE",
                         color = if (hasContact) SageGreen else MutedAmber,
                         fontSize = 9.sp,
                         fontWeight = FontWeight.Bold,
@@ -4870,6 +5525,38 @@ fun AccessActivityScreen(viewModel: SecureLegacyViewModel) {
             .background(WarmOffWhite)
             .verticalScroll(rememberScrollState())
     ) {
+        // Navigation Back to Home Button
+        Surface(
+            onClick = { viewModel.selectTab(Tab.MY_VAULT) },
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(bottom = 12.dp)
+                .testTag("back_to_home_button_access_activity"),
+            shape = RoundedCornerShape(12.dp),
+            color = Color(0xFF1E293B),
+            border = BorderStroke(1.dp, SageGreen.copy(alpha = 0.5f))
+        ) {
+            Row(
+                modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Icon(
+                    imageVector = Icons.Default.ArrowBack,
+                    contentDescription = "Back to Home",
+                    tint = SageGreen,
+                    modifier = Modifier.size(18.dp)
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(
+                    text = "Back to Home Page (My Amanat)",
+                    color = Color.White,
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.Bold,
+                    fontFamily = FontFamily.SansSerif
+                )
+            }
+        }
+
         // Upper Reset Control and Info Header
         Row(
             modifier = Modifier.fillMaxWidth(),
