@@ -1,0 +1,16 @@
+# Auto-detect text files and normalize line endings
+* text=auto eol=lf
+
+# Explicitly mark binary files to prevent corruption during Git checkout / transfer
+*.jar binary
+*.aar binary
+*.apk binary
+*.aab binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.keystore binary
+*.so binary

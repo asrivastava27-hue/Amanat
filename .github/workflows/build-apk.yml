@@ -70,6 +70,13 @@ jobs:
     - name: Make gradlew executable
       run: chmod +x gradlew
 
+    - name: Validate and Repair Gradle Wrapper
+      run: |
+        if ! java -jar gradle/wrapper/gradle-wrapper.jar --version > /dev/null 2>&1; then
+          echo "gradle-wrapper.jar is corrupted or invalid. Regenerating..."
+          gradle wrapper
+        fi
+
     - name: Build Debug APK
       run: ./gradlew assembleDebug --stacktrace
 
