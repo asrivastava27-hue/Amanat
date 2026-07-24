@@ -146,19 +146,22 @@ enum class SubscriptionTier(
     val billingCycleText: String,
     val badgeColorHex: Long
 ) {
-    FREE_TRIAL("30 Days Free Trial", "₹0", "Free for 30 days", 0xFF10B981),
-    LIFETIME_PACK("Lifetime Pack", "₹499", "one-time lifetime", 0xFF8B5CF6);
+    STANDARD_ANNUAL("Standard Plan", "₹199/yr", "Annual Membership", 0xFF10B981),
+    LIFETIME_PACK("Lifetime Heritage Pack", "₹499", "One-Time Lifetime", 0xFF8B5CF6),
+    MONTHLY_PACK("Monthly Plan", "₹49/mo", "Monthly Membership", 0xFF3B82F6);
 
     companion object {
         fun safeValueOf(name: String?): SubscriptionTier {
-            if (name.isNullOrEmpty()) return FREE_TRIAL
+            if (name.isNullOrEmpty()) return LIFETIME_PACK
             return try {
                 valueOf(name)
             } catch (e: Exception) {
-                if (name.contains("LIFETIME", ignoreCase = true) || name.contains("HERITAGE", ignoreCase = true) || name.contains("PRO", ignoreCase = true)) {
-                    LIFETIME_PACK
+                if (name.contains("ANNUAL", ignoreCase = true) || name.contains("STANDARD", ignoreCase = true) || name.contains("FREE", ignoreCase = true) || name.contains("TRIAL", ignoreCase = true)) {
+                    STANDARD_ANNUAL
+                } else if (name.contains("MONTHLY", ignoreCase = true)) {
+                    MONTHLY_PACK
                 } else {
-                    FREE_TRIAL
+                    LIFETIME_PACK
                 }
             }
         }
@@ -196,10 +199,10 @@ class SecureLegacyViewModel(application: Application) : AndroidViewModel(applica
 
     // Subscription & Payment State
     var subscriptionTier by mutableStateOf(
-        SubscriptionTier.safeValueOf(prefs.getString("subscription_tier", SubscriptionTier.FREE_TRIAL.name))
+        SubscriptionTier.safeValueOf(prefs.getString("subscription_tier", SubscriptionTier.LIFETIME_PACK.name))
     )
     var isSubscribed by mutableStateOf(true)
-    var subscriptionExpiryDate by mutableStateOf(prefs.getString("subscription_expiry", "30 Days Free Trial Active") ?: "30 Days Free Trial Active")
+    var subscriptionExpiryDate by mutableStateOf(prefs.getString("subscription_expiry", "Lifetime Access Active") ?: "Lifetime Access Active")
     var subscriptionTransactionId by mutableStateOf(prefs.getString("subscription_tx_id", "AMN-9842103") ?: "AMN-9842103")
 
     fun subscribeToPlan(tier: SubscriptionTier, paymentMethod: String): String {
@@ -207,13 +210,22 @@ class SecureLegacyViewModel(application: Application) : AndroidViewModel(applica
         subscriptionTier = tier
         isSubscribed = true
         subscriptionTransactionId = txId
-        if (tier == SubscriptionTier.FREE_TRIAL) {
-            val calendar = java.util.Calendar.getInstance()
-            calendar.add(java.util.Calendar.DAY_OF_MONTH, 30)
-            val sdf = java.text.SimpleDateFormat("MMM dd, yyyy", java.util.Locale.getDefault())
-            subscriptionExpiryDate = "30-Day Trial (Valid till " + sdf.format(calendar.time) + ")"
-        } else {
-            subscriptionExpiryDate = "Lifetime Access (No Expiry)"
+        when (tier) {
+            SubscriptionTier.STANDARD_ANNUAL -> {
+                val calendar = java.util.Calendar.getInstance()
+                calendar.add(java.util.Calendar.YEAR, 1)
+                val sdf = java.text.SimpleDateFormat("MMM dd, yyyy", java.util.Locale.getDefault())
+                subscriptionExpiryDate = "Annual Membership (Valid till " + sdf.format(calendar.time) + ")"
+            }
+            SubscriptionTier.MONTHLY_PACK -> {
+                val calendar = java.util.Calendar.getInstance()
+                calendar.add(java.util.Calendar.MONTH, 1)
+                val sdf = java.text.SimpleDateFormat("MMM dd, yyyy", java.util.Locale.getDefault())
+                subscriptionExpiryDate = "Monthly Membership (Valid till " + sdf.format(calendar.time) + ")"
+            }
+            SubscriptionTier.LIFETIME_PACK -> {
+                subscriptionExpiryDate = "Lifetime Access (No Expiry)"
+            }
         }
 
         prefs.edit().apply {
@@ -233,10 +245,10 @@ class SecureLegacyViewModel(application: Application) : AndroidViewModel(applica
 
     fun cancelSubscription() {
         val prevTier = subscriptionTier.name
-        subscriptionTier = SubscriptionTier.FREE_TRIAL
+        subscriptionTier = SubscriptionTier.STANDARD_ANNUAL
         isSubscribed = false
         prefs.edit().apply {
-            putString("subscription_tier", SubscriptionTier.FREE_TRIAL.name)
+            putString("subscription_tier", SubscriptionTier.STANDARD_ANNUAL.name)
             apply()
         }
         logAnalyticsEvent("cancel_subscription", mapOf("previous_tier" to prevTier))
@@ -372,25 +384,8 @@ class SecureLegacyViewModel(application: Application) : AndroidViewModel(applica
 
     fun loadTrustedContacts(): List<TrustedContact> {
         val jsonStr = prefs.getString("trusted_contacts_json", null)
-        val defaultContacts = listOf(
-            TrustedContact(
-                name = "Rahul Sharma",
-                relationship = "Primary Trustee",
-                email = "rahul.sharma@example.com",
-                phone = "+91 98765 43210",
-                tier = AccessTier.FULL_ACCESS
-            ),
-            TrustedContact(
-                name = "Priya Sharma",
-                relationship = "Secondary Trustee",
-                email = "priya.sharma@example.com",
-                phone = "+91 98123 45678",
-                tier = AccessTier.FINANCIAL_ONLY
-            )
-        )
         if (jsonStr.isNullOrEmpty()) {
-            saveTrustedContacts(defaultContacts)
-            return defaultContacts
+            return emptyList()
         }
         val list = mutableListOf<TrustedContact>()
         try {
@@ -400,7 +395,7 @@ class SecureLegacyViewModel(application: Application) : AndroidViewModel(applica
                 val tierName = obj.optString("tier", "FULL_ACCESS")
                 val tier = try { AccessTier.valueOf(tierName) } catch(e: Exception) { AccessTier.FULL_ACCESS }
                 val cName = obj.optString("name", "")
-                if (cName.isNotBlank()) {
+                if (cName.isNotBlank() && cName != "Rahul Sharma" && cName != "Priya Sharma") {
                     list.add(
                         TrustedContact(
                             name = cName,
@@ -415,10 +410,7 @@ class SecureLegacyViewModel(application: Application) : AndroidViewModel(applica
         } catch (e: Exception) {
             e.printStackTrace()
         }
-        return if (list.isEmpty()) {
-            saveTrustedContacts(defaultContacts)
-            defaultContacts
-        } else list
+        return list
     }
 
     fun saveLedger() {
@@ -1394,7 +1386,7 @@ fun HelpSupportDialog(viewModel: SecureLegacyViewModel, onDismiss: () -> Unit) {
                                 shape = RoundedCornerShape(12.dp)
                             ) {
                                 Text(
-                                    text = if (viewModel.isSubscribed) viewModel.subscriptionTier.displayName else "Subscribe",
+                                    text = "Subscribe",
                                     fontSize = 9.sp,
                                     fontWeight = FontWeight.Bold,
                                     color = Color(0xFFD97706),
@@ -1405,7 +1397,7 @@ fun HelpSupportDialog(viewModel: SecureLegacyViewModel, onDismiss: () -> Unit) {
 
                         Spacer(modifier = Modifier.height(6.dp))
                         Text(
-                            text = "Subscribe to 30 Days Free Trial or Lifetime Pack (₹499) for digital estate protection. Manage UPI, Card, and NetBanking payments.",
+                            text = "Subscribe to Membership Plans (Lifetime Heritage ₹499 or Annual ₹199/yr). Pay via Google Pay, Paytm, PhonePe, BHIM UPI & Cards.",
                             fontSize = 12.sp,
                             color = TextMuted,
                             fontFamily = FontFamily.SansSerif
@@ -1619,7 +1611,7 @@ fun TopBarNavigation(viewModel: SecureLegacyViewModel, onExitClick: () -> Unit) 
                         )
                         Spacer(modifier = Modifier.width(4.dp))
                         Text(
-                            text = if (viewModel.isSubscribed) viewModel.subscriptionTier.displayName else "Subscribe",
+                            text = "Subscribe",
                             color = Color.White,
                             fontSize = 11.sp,
                             fontWeight = FontWeight.Bold,
@@ -2129,97 +2121,7 @@ fun MyVaultScreen(viewModel: SecureLegacyViewModel) {
                 .verticalScroll(scrollState),
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
-            // Home Page Subscription Option Banner
-            var showSubDialogInVault by remember { mutableStateOf(false) }
-            if (showSubDialogInVault) {
-                SubscriptionPaymentDialog(viewModel = viewModel, onDismiss = { showSubDialogInVault = false })
-            }
 
-            Card(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clickable { showSubDialogInVault = true }
-                    .testTag("home_subscription_banner"),
-                colors = CardDefaults.cardColors(
-                    containerColor = if (viewModel.subscriptionTier == SubscriptionTier.LIFETIME_PACK) Color(0xFF1E1B4B) else Color(0xFF0F291E)
-                ),
-                shape = RoundedCornerShape(16.dp),
-                border = BorderStroke(1.5.dp, if (viewModel.subscriptionTier == SubscriptionTier.LIFETIME_PACK) Color(0xFF8B5CF6) else SageGreen)
-            ) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(14.dp),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(10.dp),
-                        modifier = Modifier.weight(1f)
-                    ) {
-                        Surface(
-                            shape = CircleShape,
-                            color = if (viewModel.subscriptionTier == SubscriptionTier.LIFETIME_PACK) Color(0xFF8B5CF6).copy(alpha = 0.2f) else SageGreen.copy(alpha = 0.2f),
-                            modifier = Modifier.size(38.dp)
-                        ) {
-                            Box(contentAlignment = Alignment.Center) {
-                                Icon(
-                                    imageVector = Icons.Default.Star,
-                                    contentDescription = null,
-                                    tint = if (viewModel.subscriptionTier == SubscriptionTier.LIFETIME_PACK) Color(0xFFA78BFA) else SageGreen,
-                                    modifier = Modifier.size(20.dp)
-                                )
-                            }
-                        }
-                        Column {
-                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                Text(
-                                    text = "Plan: ${viewModel.subscriptionTier.displayName}",
-                                    color = Color.White,
-                                    fontSize = 13.sp,
-                                    fontWeight = FontWeight.Bold,
-                                    fontFamily = FontFamily.Serif
-                                )
-                                Surface(
-                                    shape = RoundedCornerShape(6.dp),
-                                    color = if (viewModel.subscriptionTier == SubscriptionTier.LIFETIME_PACK) Color(0xFF8B5CF6) else SageGreen
-                                ) {
-                                    Text(
-                                        text = viewModel.subscriptionTier.priceText,
-                                        color = Color.White,
-                                        fontSize = 10.sp,
-                                        fontWeight = FontWeight.ExtraBold,
-                                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
-                                    )
-                                }
-                            }
-                            Text(
-                                text = "30 Days Free Trial or Lifetime Pack (₹499) • Tap to Subscribe",
-                                color = Color(0xFF94A3B8),
-                                fontSize = 11.sp,
-                                fontFamily = FontFamily.SansSerif
-                            )
-                        }
-                    }
-
-                    Button(
-                        onClick = { showSubDialogInVault = true },
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = if (viewModel.subscriptionTier == SubscriptionTier.LIFETIME_PACK) Color(0xFF8B5CF6) else SageGreen
-                        ),
-                        shape = RoundedCornerShape(10.dp),
-                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
-                    ) {
-                        Text(
-                            text = if (viewModel.subscriptionTier == SubscriptionTier.LIFETIME_PACK) "Manage" else "Subscribe",
-                            color = Color.White,
-                            fontSize = 12.sp,
-                            fontWeight = FontWeight.Bold
-                        )
-                    }
-                }
-            }
 
             // Category list
             VaultCategory.values().forEach { category ->
@@ -3451,6 +3353,51 @@ fun AddOrEditVaultItemDialog(
 }
 
 // ==========================================
+// UPI PAYMENT REDIRECT HELPER
+// ==========================================
+fun launchUpiPaymentApp(context: Context, appName: String, amountText: String) {
+    val cleanAmount = amountText.replace("₹", "").replace("/yr", "").replace("/mo", "").trim()
+    val amountVal = if (cleanAmount.isEmpty()) "499" else cleanAmount
+    val upiUri = Uri.parse("upi://pay?pa=amanat@upi&pn=Amanat%20Heritage%20Vault&tn=Membership%20Subscription&am=$amountVal&cu=INR")
+
+    val packageName = when (appName) {
+        "Google Pay" -> "com.google.android.apps.nps"
+        "PhonePe" -> "com.phonepe.app"
+        "Paytm" -> "net.one97.paytm"
+        "BHIM" -> "in.org.npci.upiapp"
+        else -> null
+    }
+
+    val intent = Intent(Intent.ACTION_VIEW, upiUri)
+    if (packageName != null) {
+        intent.setPackage(packageName)
+    }
+
+    try {
+        context.startActivity(intent)
+        Toast.makeText(context, "Redirecting to $appName...", Toast.LENGTH_SHORT).show()
+    } catch (e: Exception) {
+        try {
+            val chooserIntent = Intent(Intent.ACTION_VIEW, upiUri)
+            context.startActivity(Intent.createChooser(chooserIntent, "Pay via $appName"))
+        } catch (ex: Exception) {
+            val webUrl = when (appName) {
+                "Google Pay" -> "https://pay.google.com/"
+                "PhonePe" -> "https://www.phonepe.com/"
+                "Paytm" -> "https://paytm.com/"
+                "BHIM" -> "https://www.bhimupi.org.in/"
+                else -> "https://pay.google.com/"
+            }
+            try {
+                context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(webUrl)))
+            } catch (err: Exception) {
+                Toast.makeText(context, "Redirecting to $appName payment portal...", Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+}
+
+// ==========================================
 // SUBSCRIPTION & PAYMENT DIALOG
 // ==========================================
 @OptIn(ExperimentalMaterial3Api::class)
@@ -3591,7 +3538,7 @@ fun SubscriptionPaymentDialog(viewModel: SecureLegacyViewModel, onDismiss: () ->
                         Spacer(modifier = Modifier.height(16.dp))
 
                         Text(
-                            text = if (selectedPlan == SubscriptionTier.FREE_TRIAL) "Free Trial Activated!" else "Payment Successful!",
+                            text = "Membership Payment Successful!",
                             color = Color.White,
                             fontSize = 20.sp,
                             fontWeight = FontWeight.Bold,
@@ -3662,7 +3609,7 @@ fun SubscriptionPaymentDialog(viewModel: SecureLegacyViewModel, onDismiss: () ->
                                 ) {
                                     Text(text = "Payment Method", color = Color(0xFF94A3B8), fontSize = 12.sp)
                                     Text(
-                                        text = if (selectedPlan == SubscriptionTier.FREE_TRIAL) "Direct Activation (No Payment)" else "$selectedPaymentMethod ($selectedUpiApp)",
+                                        text = "$selectedPaymentMethod ($selectedUpiApp)",
                                         color = Color.White,
                                         fontSize = 12.sp,
                                         fontWeight = FontWeight.Medium
@@ -3844,7 +3791,7 @@ fun SubscriptionPaymentDialog(viewModel: SecureLegacyViewModel, onDismiss: () ->
                                             Text(text = "Connected to $selectedBank secure authorization gateway.", color = Color(0xFF94A3B8), fontSize = 11.sp)
                                             Spacer(modifier = Modifier.height(8.dp))
                                             Text(text = "Account Holder: ${cardHolder.ifEmpty { "Amanat Vault User" }}", color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
-                                            Text(text = "Total Amount to Debit: ₹499", color = SageGreen, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                                            Text(text = "Total Amount to Debit: ${selectedPlan.priceText}", color = SageGreen, fontSize = 12.sp, fontWeight = FontWeight.Bold)
                                         }
                                     }
                                 }
@@ -3880,7 +3827,7 @@ fun SubscriptionPaymentDialog(viewModel: SecureLegacyViewModel, onDismiss: () ->
                                     colors = ButtonDefaults.buttonColors(containerColor = SageGreen),
                                     shape = RoundedCornerShape(12.dp)
                                 ) {
-                                    Text("Authorize & Pay ₹499", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                                    Text("Authorize & Pay ${selectedPlan.priceText}", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
                                 }
                             }
                         }
@@ -3955,130 +3902,188 @@ fun SubscriptionPaymentDialog(viewModel: SecureLegacyViewModel, onDismiss: () ->
                             }
                         }
 
-                        // STEP 1: SELECT PLAN
+                        // STEP 1: SELECT MEMBERSHIP PLAN
                         Text(
-                            text = "1. CHOOSE YOUR SUBSCRIPTION OPTION",
+                            text = "1. CHOOSE YOUR MEMBERSHIP PLAN",
                             color = Color(0xFFFBBF24),
                             fontSize = 11.sp,
                             fontWeight = FontWeight.ExtraBold,
                             letterSpacing = 1.sp
                         )
 
-                        // Option 1: 30 Days Free Trial
-                        PlanOptionCard(
-                            tier = SubscriptionTier.FREE_TRIAL,
-                            tagText = "30 DAYS FREE",
-                            features = listOf(
-                                "30 Days Free Trial Access",
-                                "Basic Vault Storage across all categories",
-                                "Add up to 2 Trusted Contacts",
-                                "Standard Grace Period Protocol"
-                            ),
-                            isSelected = selectedPlan == SubscriptionTier.FREE_TRIAL,
-                            onSelect = { selectedPlan = SubscriptionTier.FREE_TRIAL }
-                        )
-
-                        // Option 2: Lifetime Pack for 499
+                        // Option 1: Lifetime Heritage Pack (Best Value)
                         PlanOptionCard(
                             tier = SubscriptionTier.LIFETIME_PACK,
                             tagText = "BEST VALUE • ₹499",
-                            features = listOf(
-                                "Lifetime Access — Pay Once (₹499), No Monthly Fees",
-                                "Unlimited Digital Vault Assets & Document Attachments",
-                                "Priority Emergency Protocol & Legal Executor Portal",
-                                "Encrypted Cloud Sync & Dedicated Support"
-                            ),
                             isSelected = selectedPlan == SubscriptionTier.LIFETIME_PACK,
                             onSelect = { selectedPlan = SubscriptionTier.LIFETIME_PACK }
                         )
 
-                        if (selectedPlan == SubscriptionTier.LIFETIME_PACK) {
-                            // STEP 2: PAYMENT METHOD
-                            Spacer(modifier = Modifier.height(6.dp))
-                            Text(
-                                text = "2. SELECT PAYMENT METHOD FOR ₹499",
-                                color = SageGreen,
-                                fontSize = 11.sp,
-                                fontWeight = FontWeight.ExtraBold,
-                                letterSpacing = 1.sp
+                        // Option 2: Standard Annual Membership
+                        PlanOptionCard(
+                            tier = SubscriptionTier.STANDARD_ANNUAL,
+                            tagText = "POPULAR • ₹199/YR",
+                            isSelected = selectedPlan == SubscriptionTier.STANDARD_ANNUAL,
+                            onSelect = { selectedPlan = SubscriptionTier.STANDARD_ANNUAL }
+                        )
+
+                        // Option 3: Monthly Membership
+                        PlanOptionCard(
+                            tier = SubscriptionTier.MONTHLY_PACK,
+                            tagText = "FLEXIBLE • ₹49/MO",
+                            isSelected = selectedPlan == SubscriptionTier.MONTHLY_PACK,
+                            onSelect = { selectedPlan = SubscriptionTier.MONTHLY_PACK }
+                        )
+
+                        // STEP 2: PAYMENT METHOD FOR SELECTED MEMBERSHIP
+                        Spacer(modifier = Modifier.height(6.dp))
+                        Text(
+                            text = "2. SELECT PAYMENT METHOD FOR ${selectedPlan.displayName} (${selectedPlan.priceText})",
+                            color = SageGreen,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.ExtraBold,
+                            letterSpacing = 1.sp
+                        )
+
+                        // Payment Method Selector Tabs
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            PaymentMethodChip(
+                                title = "UPI Apps",
+                                icon = Icons.Default.QrCode,
+                                isSelected = selectedPaymentMethod == "UPI",
+                                onClick = { selectedPaymentMethod = "UPI" },
+                                modifier = Modifier.weight(1f)
                             )
+                            PaymentMethodChip(
+                                title = "Card",
+                                icon = Icons.Default.CreditCard,
+                                isSelected = selectedPaymentMethod == "CARD",
+                                onClick = { selectedPaymentMethod = "CARD" },
+                                modifier = Modifier.weight(1f)
+                            )
+                            PaymentMethodChip(
+                                title = "NetBanking",
+                                icon = Icons.Default.AccountBalance,
+                                isSelected = selectedPaymentMethod == "NETBANKING",
+                                onClick = { selectedPaymentMethod = "NETBANKING" },
+                                modifier = Modifier.weight(1f)
+                            )
+                        }
 
-                            // Payment Method Selector Tabs
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.spacedBy(8.dp)
-                            ) {
-                                PaymentMethodChip(
-                                    title = "UPI / QR",
-                                    icon = Icons.Default.QrCode,
-                                    isSelected = selectedPaymentMethod == "UPI",
-                                    onClick = { selectedPaymentMethod = "UPI" },
-                                    modifier = Modifier.weight(1f)
-                                )
-                                PaymentMethodChip(
-                                    title = "Card",
-                                    icon = Icons.Default.CreditCard,
-                                    isSelected = selectedPaymentMethod == "CARD",
-                                    onClick = { selectedPaymentMethod = "CARD" },
-                                    modifier = Modifier.weight(1f)
-                                )
-                                PaymentMethodChip(
-                                    title = "NetBanking",
-                                    icon = Icons.Default.AccountBalance,
-                                    isSelected = selectedPaymentMethod == "NETBANKING",
-                                    onClick = { selectedPaymentMethod = "NETBANKING" },
-                                    modifier = Modifier.weight(1f)
-                                )
-                            }
+                        // Dynamic Payment Method Inputs
+                        Card(
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = CardDefaults.cardColors(containerColor = Color(0xFF1E293B)),
+                            shape = RoundedCornerShape(14.dp),
+                            border = BorderStroke(1.dp, Color(0xFF334155))
+                        ) {
+                            Column(modifier = Modifier.padding(16.dp)) {
+                                when (selectedPaymentMethod) {
+                                    "UPI" -> {
+                                        Text(
+                                            text = "Select UPI App to Redirect & Pay:",
+                                            color = Color.White,
+                                            fontSize = 12.sp,
+                                            fontWeight = FontWeight.Bold
+                                        )
+                                        Spacer(modifier = Modifier.height(10.dp))
 
-                            // Dynamic Payment Method Inputs
-                            Card(
-                                modifier = Modifier.fillMaxWidth(),
-                                colors = CardDefaults.cardColors(containerColor = Color(0xFF1E293B)),
-                                shape = RoundedCornerShape(14.dp),
-                                border = BorderStroke(1.dp, Color(0xFF334155))
-                            ) {
-                                Column(modifier = Modifier.padding(16.dp)) {
-                                    when (selectedPaymentMethod) {
-                                        "UPI" -> {
-                                            Text(
-                                                text = "Select Preferred UPI App & Enter VPA:",
-                                                color = Color.White,
-                                                fontSize = 12.sp,
-                                                fontWeight = FontWeight.Bold
-                                            )
-                                            Spacer(modifier = Modifier.height(10.dp))
-
-                                            Row(
-                                                modifier = Modifier.fillMaxWidth(),
-                                                horizontalArrangement = Arrangement.spacedBy(8.dp)
-                                            ) {
-                                                listOf("Google Pay", "PhonePe", "Paytm", "BHIM").forEach { appName ->
-                                                    Surface(
-                                                        onClick = { selectedUpiApp = appName },
-                                                        shape = RoundedCornerShape(8.dp),
-                                                        color = if (selectedUpiApp == appName) SageGreen.copy(alpha = 0.3f) else Color(0xFF0F172A),
-                                                        border = BorderStroke(1.dp, if (selectedUpiApp == appName) SageGreen else Color(0xFF334155)),
-                                                        modifier = Modifier.weight(1f)
+                                        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                            listOf(
+                                                Pair("Google Pay", Color(0xFF4285F4)),
+                                                Pair("PhonePe", Color(0xFF5F259F)),
+                                                Pair("Paytm", Color(0xFF00B9F1)),
+                                                Pair("BHIM", Color(0xFF2E7D32))
+                                            ).forEach { (appName, appBrandColor) ->
+                                                Surface(
+                                                    onClick = {
+                                                        selectedUpiApp = appName
+                                                        launchUpiPaymentApp(context, appName, selectedPlan.priceText)
+                                                    },
+                                                    shape = RoundedCornerShape(10.dp),
+                                                    color = if (selectedUpiApp == appName) appBrandColor.copy(alpha = 0.25f) else Color(0xFF0F172A),
+                                                    border = BorderStroke(1.5.dp, if (selectedUpiApp == appName) appBrandColor else Color(0xFF334155))
+                                                ) {
+                                                    Row(
+                                                        modifier = Modifier
+                                                            .fillMaxWidth()
+                                                            .padding(horizontal = 14.dp, vertical = 12.dp),
+                                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                                        verticalAlignment = Alignment.CenterVertically
                                                     ) {
-                                                        Text(
-                                                            text = appName,
-                                                            color = Color.White,
-                                                            fontSize = 10.sp,
-                                                            fontWeight = FontWeight.Bold,
-                                                            textAlign = TextAlign.Center,
-                                                            modifier = Modifier.padding(vertical = 8.dp)
-                                                        )
+                                                        Row(
+                                                            verticalAlignment = Alignment.CenterVertically,
+                                                            horizontalArrangement = Arrangement.spacedBy(10.dp)
+                                                        ) {
+                                                            Box(
+                                                                modifier = Modifier
+                                                                    .size(28.dp)
+                                                                    .clip(CircleShape)
+                                                                    .background(appBrandColor),
+                                                                contentAlignment = Alignment.Center
+                                                            ) {
+                                                                Text(
+                                                                    text = appName.take(1),
+                                                                    color = Color.White,
+                                                                    fontWeight = FontWeight.Bold,
+                                                                    fontSize = 13.sp
+                                                                )
+                                                            }
+                                                            Text(
+                                                                text = appName,
+                                                                color = Color.White,
+                                                                fontSize = 14.sp,
+                                                                fontWeight = FontWeight.Bold
+                                                            )
+                                                        }
+                                                        Row(
+                                                            verticalAlignment = Alignment.CenterVertically,
+                                                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                                        ) {
+                                                            Text(
+                                                                text = "Pay ${selectedPlan.priceText}",
+                                                                color = appBrandColor,
+                                                                fontSize = 12.sp,
+                                                                fontWeight = FontWeight.Bold
+                                                            )
+                                                            Icon(
+                                                                imageVector = Icons.Default.Launch,
+                                                                contentDescription = "Redirect",
+                                                                tint = appBrandColor,
+                                                                modifier = Modifier.size(16.dp)
+                                                            )
+                                                        }
                                                     }
                                                 }
                                             }
+                                        }
 
-                                            Spacer(modifier = Modifier.height(12.dp))
+                                        Spacer(modifier = Modifier.height(12.dp))
 
+                                        OutlinedTextField(
+                                            value = upiId,
+                                            onValueChange = { upiId = it },
+                                            label = { Text("UPI VPA ID", color = Color(0xFF94A3B8), fontSize = 11.sp) },
+                                            modifier = Modifier.fillMaxWidth(),
+                                            textStyle = androidx.compose.ui.text.TextStyle(color = Color.White, fontSize = 13.sp),
+                                            colors = OutlinedTextFieldDefaults.colors(
+                                                focusedBorderColor = SageGreen,
+                                                unfocusedBorderColor = Color(0xFF334155)
+                                            ),
+                                            shape = RoundedCornerShape(10.dp),
+                                            singleLine = true
+                                        )
+                                    }
+
+                                    "CARD" -> {
+                                        Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                                             OutlinedTextField(
-                                                value = upiId,
-                                                onValueChange = { upiId = it },
-                                                label = { Text("UPI VPA ID", color = Color(0xFF94A3B8), fontSize = 11.sp) },
+                                                value = cardHolder,
+                                                onValueChange = { cardHolder = it },
+                                                label = { Text("Name on Card", color = Color(0xFF94A3B8), fontSize = 11.sp) },
                                                 modifier = Modifier.fillMaxWidth(),
                                                 textStyle = androidx.compose.ui.text.TextStyle(color = Color.White, fontSize = 13.sp),
                                                 colors = OutlinedTextFieldDefaults.colors(
@@ -4088,15 +4093,27 @@ fun SubscriptionPaymentDialog(viewModel: SecureLegacyViewModel, onDismiss: () ->
                                                 shape = RoundedCornerShape(10.dp),
                                                 singleLine = true
                                             )
-                                        }
 
-                                        "CARD" -> {
-                                            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                                            OutlinedTextField(
+                                                value = cardNumber,
+                                                onValueChange = { cardNumber = it },
+                                                label = { Text("Card Number", color = Color(0xFF94A3B8), fontSize = 11.sp) },
+                                                modifier = Modifier.fillMaxWidth(),
+                                                textStyle = androidx.compose.ui.text.TextStyle(color = Color.White, fontSize = 13.sp, fontFamily = FontFamily.Monospace),
+                                                colors = OutlinedTextFieldDefaults.colors(
+                                                    focusedBorderColor = SageGreen,
+                                                    unfocusedBorderColor = Color(0xFF334155)
+                                                ),
+                                                shape = RoundedCornerShape(10.dp),
+                                                singleLine = true
+                                            )
+
+                                            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                                                 OutlinedTextField(
-                                                    value = cardHolder,
-                                                    onValueChange = { cardHolder = it },
-                                                    label = { Text("Name on Card", color = Color(0xFF94A3B8), fontSize = 11.sp) },
-                                                    modifier = Modifier.fillMaxWidth(),
+                                                    value = cardExpiry,
+                                                    onValueChange = { cardExpiry = it },
+                                                    label = { Text("Expiry (MM/YY)", color = Color(0xFF94A3B8), fontSize = 11.sp) },
+                                                    modifier = Modifier.weight(1f),
                                                     textStyle = androidx.compose.ui.text.TextStyle(color = Color.White, fontSize = 13.sp),
                                                     colors = OutlinedTextFieldDefaults.colors(
                                                         focusedBorderColor = SageGreen,
@@ -4107,11 +4124,11 @@ fun SubscriptionPaymentDialog(viewModel: SecureLegacyViewModel, onDismiss: () ->
                                                 )
 
                                                 OutlinedTextField(
-                                                    value = cardNumber,
-                                                    onValueChange = { cardNumber = it },
-                                                    label = { Text("Card Number", color = Color(0xFF94A3B8), fontSize = 11.sp) },
-                                                    modifier = Modifier.fillMaxWidth(),
-                                                    textStyle = androidx.compose.ui.text.TextStyle(color = Color.White, fontSize = 13.sp, fontFamily = FontFamily.Monospace),
+                                                    value = cardCvv,
+                                                    onValueChange = { cardCvv = it },
+                                                    label = { Text("CVV", color = Color(0xFF94A3B8), fontSize = 11.sp) },
+                                                    modifier = Modifier.weight(1f),
+                                                    textStyle = androidx.compose.ui.text.TextStyle(color = Color.White, fontSize = 13.sp),
                                                     colors = OutlinedTextFieldDefaults.colors(
                                                         focusedBorderColor = SageGreen,
                                                         unfocusedBorderColor = Color(0xFF334155)
@@ -4119,67 +4136,37 @@ fun SubscriptionPaymentDialog(viewModel: SecureLegacyViewModel, onDismiss: () ->
                                                     shape = RoundedCornerShape(10.dp),
                                                     singleLine = true
                                                 )
-
-                                                Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                                                    OutlinedTextField(
-                                                        value = cardExpiry,
-                                                        onValueChange = { cardExpiry = it },
-                                                        label = { Text("Expiry (MM/YY)", color = Color(0xFF94A3B8), fontSize = 11.sp) },
-                                                        modifier = Modifier.weight(1f),
-                                                        textStyle = androidx.compose.ui.text.TextStyle(color = Color.White, fontSize = 13.sp),
-                                                        colors = OutlinedTextFieldDefaults.colors(
-                                                            focusedBorderColor = SageGreen,
-                                                            unfocusedBorderColor = Color(0xFF334155)
-                                                        ),
-                                                        shape = RoundedCornerShape(10.dp),
-                                                        singleLine = true
-                                                    )
-
-                                                    OutlinedTextField(
-                                                        value = cardCvv,
-                                                        onValueChange = { cardCvv = it },
-                                                        label = { Text("CVV", color = Color(0xFF94A3B8), fontSize = 11.sp) },
-                                                        modifier = Modifier.weight(1f),
-                                                        textStyle = androidx.compose.ui.text.TextStyle(color = Color.White, fontSize = 13.sp),
-                                                        colors = OutlinedTextFieldDefaults.colors(
-                                                            focusedBorderColor = SageGreen,
-                                                            unfocusedBorderColor = Color(0xFF334155)
-                                                        ),
-                                                        shape = RoundedCornerShape(10.dp),
-                                                        singleLine = true
-                                                    )
-                                                }
                                             }
                                         }
+                                    }
 
-                                        "NETBANKING" -> {
-                                            Text(
-                                                text = "Select Your Net Banking Account:",
-                                                color = Color.White,
-                                                fontSize = 12.sp,
-                                                fontWeight = FontWeight.Bold
-                                            )
-                                            Spacer(modifier = Modifier.height(10.dp))
+                                    "NETBANKING" -> {
+                                        Text(
+                                            text = "Select Your Net Banking Account:",
+                                            color = Color.White,
+                                            fontSize = 12.sp,
+                                            fontWeight = FontWeight.Bold
+                                        )
+                                        Spacer(modifier = Modifier.height(10.dp))
 
-                                            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                                                listOf("HDFC Bank", "ICICI Bank", "State Bank of India (SBI)", "Axis Bank", "Kotak Mahindra").forEach { bank ->
-                                                    Surface(
-                                                        onClick = { selectedBank = bank },
-                                                        shape = RoundedCornerShape(8.dp),
-                                                        color = if (selectedBank == bank) SageGreen.copy(alpha = 0.25f) else Color(0xFF0F172A),
-                                                        border = BorderStroke(1.dp, if (selectedBank == bank) SageGreen else Color(0xFF334155))
+                                        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                            listOf("HDFC Bank", "ICICI Bank", "State Bank of India (SBI)", "Axis Bank", "Kotak Mahindra").forEach { bank ->
+                                                Surface(
+                                                    onClick = { selectedBank = bank },
+                                                    shape = RoundedCornerShape(8.dp),
+                                                    color = if (selectedBank == bank) SageGreen.copy(alpha = 0.25f) else Color(0xFF0F172A),
+                                                    border = BorderStroke(1.dp, if (selectedBank == bank) SageGreen else Color(0xFF334155))
+                                                ) {
+                                                    Row(
+                                                        modifier = Modifier
+                                                            .fillMaxWidth()
+                                                            .padding(horizontal = 12.dp, vertical = 8.dp),
+                                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                                        verticalAlignment = Alignment.CenterVertically
                                                     ) {
-                                                        Row(
-                                                            modifier = Modifier
-                                                                .fillMaxWidth()
-                                                                .padding(horizontal = 12.dp, vertical = 8.dp),
-                                                            horizontalArrangement = Arrangement.SpaceBetween,
-                                                            verticalAlignment = Alignment.CenterVertically
-                                                        ) {
-                                                            Text(text = bank, color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Medium)
-                                                            if (selectedBank == bank) {
-                                                                Icon(imageVector = Icons.Default.CheckCircle, contentDescription = null, tint = SageGreen, modifier = Modifier.size(16.dp))
-                                                            }
+                                                        Text(text = bank, color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Medium)
+                                                        if (selectedBank == bank) {
+                                                            Icon(imageVector = Icons.Default.CheckCircle, contentDescription = null, tint = SageGreen, modifier = Modifier.size(16.dp))
                                                         }
                                                     }
                                                 }
@@ -4194,41 +4181,28 @@ fun SubscriptionPaymentDialog(viewModel: SecureLegacyViewModel, onDismiss: () ->
                     Spacer(modifier = Modifier.height(14.dp))
 
                     // ACTION BUTTON
-                    if (selectedPlan == SubscriptionTier.FREE_TRIAL) {
-                        Button(
-                            onClick = {
-                                val txId = viewModel.subscribeToPlan(SubscriptionTier.FREE_TRIAL, "Direct Activation")
-                                activeTxId = txId
-                                showReceipt = true
-                                Toast.makeText(context, "30-Day Free Trial Activated!", Toast.LENGTH_SHORT).show()
-                            },
-                            modifier = Modifier.fillMaxWidth(),
-                            colors = ButtonDefaults.buttonColors(containerColor = SageGreen),
-                            shape = RoundedCornerShape(12.dp)
-                        ) {
-                            Text("Activate 30 Days Free Trial (₹0)", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 14.sp)
-                        }
-                    } else {
-                        Button(
-                            onClick = {
-                                showPaymentGateway = true
-                            },
-                            modifier = Modifier.fillMaxWidth(),
-                            colors = ButtonDefaults.buttonColors(containerColor = SageGreen),
-                            shape = RoundedCornerShape(12.dp)
-                        ) {
-                            Row(
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(8.dp)
-                            ) {
-                                Icon(imageVector = Icons.Default.Lock, contentDescription = null, tint = Color.White, modifier = Modifier.size(18.dp))
-                                Text(
-                                    text = "Proceed to Pay ₹499 & Get Lifetime Pack",
-                                    color = Color.White,
-                                    fontWeight = FontWeight.Bold,
-                                    fontSize = 14.sp
-                                )
+                    Button(
+                        onClick = {
+                            if (selectedPaymentMethod == "UPI") {
+                                launchUpiPaymentApp(context, selectedUpiApp, selectedPlan.priceText)
                             }
+                            showPaymentGateway = true
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = ButtonDefaults.buttonColors(containerColor = SageGreen),
+                        shape = RoundedCornerShape(12.dp)
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Icon(imageVector = if (selectedPaymentMethod == "UPI") Icons.Default.Launch else Icons.Default.Lock, contentDescription = null, tint = Color.White, modifier = Modifier.size(18.dp))
+                            Text(
+                                text = if (selectedPaymentMethod == "UPI") "Pay ${selectedPlan.priceText} via $selectedUpiApp (Redirect)" else "Proceed to Pay ${selectedPlan.priceText} & Subscribe",
+                                color = Color.White,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 14.sp
+                            )
                         }
                     }
                 }
@@ -4241,7 +4215,6 @@ fun SubscriptionPaymentDialog(viewModel: SecureLegacyViewModel, onDismiss: () ->
 private fun PlanOptionCard(
     tier: SubscriptionTier,
     tagText: String,
-    features: List<String>,
     isSelected: Boolean,
     onSelect: () -> Unit
 ) {
@@ -4250,74 +4223,50 @@ private fun PlanOptionCard(
             .fillMaxWidth()
             .clickable { onSelect() },
         colors = CardDefaults.cardColors(containerColor = if (isSelected) Color(0xFF1E293B) else Color(0xFF0F172A)),
-        shape = RoundedCornerShape(14.dp),
+        shape = RoundedCornerShape(12.dp),
         border = BorderStroke(if (isSelected) 2.dp else 1.dp, if (isSelected) SageGreen else Color(0xFF334155))
     ) {
-        Column(modifier = Modifier.padding(14.dp)) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    RadioButton(
-                        selected = isSelected,
-                        onClick = onSelect,
-                        colors = RadioButtonDefaults.colors(selectedColor = SageGreen, unselectedColor = Color(0xFF94A3B8))
-                    )
-                    Column {
-                        Text(
-                            text = tier.displayName,
-                            color = Color.White,
-                            fontSize = 14.sp,
-                            fontWeight = FontWeight.Bold,
-                            fontFamily = FontFamily.Serif
-                        )
-                        Text(
-                            text = "${tier.priceText} / ${tier.billingCycleText}",
-                            color = SageGreen,
-                            fontSize = 12.sp,
-                            fontWeight = FontWeight.ExtraBold
-                        )
-                    }
-                }
-
-                Surface(
-                    shape = RoundedCornerShape(8.dp),
-                    color = if (isSelected) SageGreen else Color(0xFF334155)
-                ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 14.dp, vertical = 12.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                RadioButton(
+                    selected = isSelected,
+                    onClick = onSelect,
+                    colors = RadioButtonDefaults.colors(selectedColor = SageGreen, unselectedColor = Color(0xFF94A3B8))
+                )
+                Column {
                     Text(
-                        text = tagText,
+                        text = tier.displayName,
                         color = Color.White,
-                        fontSize = 9.sp,
-                        fontWeight = FontWeight.ExtraBold,
-                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.Bold,
+                        fontFamily = FontFamily.Serif
+                    )
+                    Text(
+                        text = "${tier.priceText} (${tier.billingCycleText})",
+                        color = SageGreen,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold
                     )
                 }
             }
 
-            Spacer(modifier = Modifier.height(8.dp))
-
-            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                features.forEach { feat ->
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(6.dp)
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.Check,
-                            contentDescription = null,
-                            tint = SageGreen,
-                            modifier = Modifier.size(13.dp)
-                        )
-                        Text(
-                            text = feat,
-                            color = Color(0xFFCBD5E1),
-                            fontSize = 11.sp,
-                            lineHeight = 15.sp
-                        )
-                    }
-                }
+            Surface(
+                shape = RoundedCornerShape(8.dp),
+                color = if (isSelected) SageGreen else Color(0xFF334155)
+            ) {
+                Text(
+                    text = tagText,
+                    color = Color.White,
+                    fontSize = 10.sp,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
+                )
             }
         }
     }
@@ -4941,7 +4890,7 @@ fun TrustedContactSlotCard(
     onSave: (name: String, email: String, phone: String) -> Unit,
     onDelete: () -> Unit
 ) {
-    var isEditing by remember(contact) { mutableStateOf(contact == null || contact.name.isBlank()) }
+    var isEditing by remember(contact) { mutableStateOf(false) }
     var nameInput by remember(contact) { mutableStateOf(contact?.name ?: "") }
     var emailInput by remember(contact) { mutableStateOf(contact?.email ?: "") }
     var phoneInput by remember(contact) { mutableStateOf(contact?.phone ?: "") }
@@ -4959,7 +4908,7 @@ fun TrustedContactSlotCard(
                 RoundedCornerShape(16.dp)
             ),
         colors = CardDefaults.cardColors(containerColor = WarmCard),
-        elevation = CardDefaults.cardElevation(10.dp),
+        elevation = CardDefaults.cardElevation(8.dp),
         shape = RoundedCornerShape(16.dp)
     ) {
         Column(modifier = Modifier.padding(18.dp)) {
@@ -4973,11 +4922,10 @@ fun TrustedContactSlotCard(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    // Glowing 3D Pill Badge
                     Surface(
                         shape = RoundedCornerShape(8.dp),
                         color = if (slotIndex == 0) SageGreen else Color(0xFF38BDF8),
-                        shadowElevation = 4.dp
+                        shadowElevation = 2.dp
                     ) {
                         Text(
                             text = "PERSON ${slotIndex + 1}",
@@ -4992,29 +4940,27 @@ fun TrustedContactSlotCard(
                     Text(
                         text = slotTitle,
                         color = TextDark,
-                        fontSize = 15.sp,
+                        fontSize = 14.sp,
                         fontWeight = FontWeight.Bold,
                         fontFamily = FontFamily.Serif
                     )
                 }
 
-                // Configured indicator
-                Surface(
-                    shape = RoundedCornerShape(12.dp),
-                    color = if (hasContact) SageGreen.copy(alpha = 0.15f) else MutedAmber.copy(alpha = 0.15f),
-                    border = BorderStroke(
-                        1.dp,
-                        if (hasContact) SageGreen.copy(alpha = 0.4f) else MutedAmber.copy(alpha = 0.4f)
-                    )
-                ) {
-                    Text(
-                        text = if (hasContact) "CONFIGURED" else "READY TO CONFIGURE",
-                        color = if (hasContact) SageGreen else MutedAmber,
-                        fontSize = 9.sp,
-                        fontWeight = FontWeight.Bold,
-                        fontFamily = FontFamily.Monospace,
-                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
-                    )
+                if (hasContact) {
+                    Surface(
+                        shape = RoundedCornerShape(10.dp),
+                        color = SageGreen.copy(alpha = 0.15f),
+                        border = BorderStroke(1.dp, SageGreen.copy(alpha = 0.4f))
+                    ) {
+                        Text(
+                            text = "CONFIGURED",
+                            color = SageGreen,
+                            fontSize = 9.sp,
+                            fontWeight = FontWeight.Bold,
+                            fontFamily = FontFamily.Monospace,
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
+                        )
+                    }
                 }
             }
 
@@ -5022,14 +4968,64 @@ fun TrustedContactSlotCard(
             HorizontalDivider(color = CardBorder)
             Spacer(modifier = Modifier.height(14.dp))
 
-            if (!isEditing && hasContact) {
-                // READ-ONLY DISPLAY VIEW
-                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            if (!isEditing && !hasContact) {
+                // CLEAN EMPTY STATE WITH ADD CONTACT BUTTON
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 4.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Add Contact ${slotIndex + 1}",
+                            fontSize = 14.sp,
+                            color = TextDark,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Text(
+                            text = "Full Name, Email ID & Contact Number",
+                            fontSize = 11.sp,
+                            color = TextMuted
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.width(8.dp))
+
+                    Button(
+                        onClick = {
+                            nameInput = ""
+                            emailInput = ""
+                            phoneInput = ""
+                            isEditing = true
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = SageGreen),
+                        shape = RoundedCornerShape(10.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Add,
+                            contentDescription = null,
+                            tint = Color.White,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text(
+                            text = "Add",
+                            color = Color.White,
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                }
+            } else if (!isEditing && hasContact) {
+                // READ-ONLY DISPLAY VIEW FOR CONFIGURED CONTACT
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                     // Full Name
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Box(
                             modifier = Modifier
-                                .size(32.dp)
+                                .size(34.dp)
                                 .clip(RoundedCornerShape(8.dp))
                                 .background(SageGreen.copy(alpha = 0.2f)),
                             contentAlignment = Alignment.Center
@@ -5062,7 +5058,7 @@ fun TrustedContactSlotCard(
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Box(
                             modifier = Modifier
-                                .size(32.dp)
+                                .size(34.dp)
                                 .clip(RoundedCornerShape(8.dp))
                                 .background(Color(0xFF38BDF8).copy(alpha = 0.2f)),
                             contentAlignment = Alignment.Center
@@ -5083,7 +5079,7 @@ fun TrustedContactSlotCard(
                                 color = TextMuted
                             )
                             Text(
-                                text = contact!!.email,
+                                text = contact!!.email.ifEmpty { "Not specified" },
                                 fontSize = 13.sp,
                                 fontWeight = FontWeight.Medium,
                                 color = TextDark
@@ -5095,7 +5091,7 @@ fun TrustedContactSlotCard(
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Box(
                             modifier = Modifier
-                                .size(32.dp)
+                                .size(34.dp)
                                 .clip(RoundedCornerShape(8.dp))
                                 .background(MutedAmber.copy(alpha = 0.2f)),
                             contentAlignment = Alignment.Center
@@ -5132,7 +5128,6 @@ fun TrustedContactSlotCard(
                         horizontalArrangement = Arrangement.End,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        // Edit Button
                         OutlinedButton(
                             onClick = { isEditing = true },
                             shape = RoundedCornerShape(10.dp),
@@ -5151,7 +5146,6 @@ fun TrustedContactSlotCard(
 
                         Spacer(modifier = Modifier.width(8.dp))
 
-                        // Remove Button
                         IconButton(
                             onClick = onDelete,
                             modifier = Modifier
@@ -5170,20 +5164,21 @@ fun TrustedContactSlotCard(
                     }
                 }
             } else {
-                // EDIT OR ADD FORM INLINE
+                // FORM TO ADD / EDIT CONTACT INLINE
                 Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    // Name Field
                     Text(
-                        text = "1. FULL NAME",
-                        fontSize = 10.sp,
+                        text = if (hasContact) "Edit Contact ${slotIndex + 1}" else "Add Contact ${slotIndex + 1}",
+                        fontSize = 12.sp,
                         fontWeight = FontWeight.Bold,
-                        color = TextMuted
+                        color = SageGreen
                     )
+
                     OutlinedTextField(
                         value = nameInput,
                         onValueChange = { nameInput = it },
+                        label = { Text("Full Name", color = TextMuted, fontSize = 11.sp) },
+                        leadingIcon = { Icon(Icons.Default.Person, contentDescription = null, tint = SageGreen, modifier = Modifier.size(18.dp)) },
                         textStyle = MaterialTheme.typography.bodyMedium.copy(color = TextDark, fontSize = 14.sp),
-                        placeholder = { Text("e.g. Rahul Sharma", color = TextMuted.copy(alpha = 0.5f)) },
                         colors = OutlinedTextFieldDefaults.colors(
                             focusedBorderColor = SageGreen,
                             unfocusedBorderColor = CardBorder,
@@ -5195,18 +5190,12 @@ fun TrustedContactSlotCard(
                         shape = RoundedCornerShape(10.dp)
                     )
 
-                    // Email Field
-                    Text(
-                        text = "2. EMAIL ID",
-                        fontSize = 10.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = TextMuted
-                    )
                     OutlinedTextField(
                         value = emailInput,
                         onValueChange = { emailInput = it },
+                        label = { Text("Email ID", color = TextMuted, fontSize = 11.sp) },
+                        leadingIcon = { Icon(Icons.Default.Email, contentDescription = null, tint = Color(0xFF38BDF8), modifier = Modifier.size(18.dp)) },
                         textStyle = MaterialTheme.typography.bodyMedium.copy(color = TextDark, fontSize = 14.sp),
-                        placeholder = { Text("e.g. rahul@example.com", color = TextMuted.copy(alpha = 0.5f)) },
                         colors = OutlinedTextFieldDefaults.colors(
                             focusedBorderColor = SageGreen,
                             unfocusedBorderColor = CardBorder,
@@ -5218,18 +5207,12 @@ fun TrustedContactSlotCard(
                         shape = RoundedCornerShape(10.dp)
                     )
 
-                    // Contact Number Field
-                    Text(
-                        text = "3. CONTACT NUMBER",
-                        fontSize = 10.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = TextMuted
-                    )
                     OutlinedTextField(
                         value = phoneInput,
                         onValueChange = { phoneInput = it },
+                        label = { Text("Contact Number", color = TextMuted, fontSize = 11.sp) },
+                        leadingIcon = { Icon(Icons.Default.Phone, contentDescription = null, tint = MutedAmber, modifier = Modifier.size(18.dp)) },
                         textStyle = MaterialTheme.typography.bodyMedium.copy(color = TextDark, fontSize = 14.sp),
-                        placeholder = { Text("e.g. +91 98765 43210", color = TextMuted.copy(alpha = 0.5f)) },
                         colors = OutlinedTextFieldDefaults.colors(
                             focusedBorderColor = SageGreen,
                             unfocusedBorderColor = CardBorder,
@@ -5241,65 +5224,39 @@ fun TrustedContactSlotCard(
                         shape = RoundedCornerShape(10.dp)
                     )
 
-                    Spacer(modifier = Modifier.height(4.dp))
+                    Spacer(modifier = Modifier.height(6.dp))
 
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.End,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        if (hasContact) {
-                            TextButton(
-                                onClick = {
-                                    nameInput = contact?.name ?: ""
-                                    emailInput = contact?.email ?: ""
-                                    phoneInput = contact?.phone ?: ""
-                                    isEditing = false
-                                }
-                            ) {
-                                Text("Cancel", color = TextMuted, fontSize = 12.sp)
+                        TextButton(
+                            onClick = {
+                                nameInput = contact?.name ?: ""
+                                emailInput = contact?.email ?: ""
+                                phoneInput = contact?.phone ?: ""
+                                isEditing = false
                             }
-                            Spacer(modifier = Modifier.width(8.dp))
+                        ) {
+                            Text("Cancel", color = TextMuted, fontSize = 12.sp)
                         }
 
-                        // 3D Save Button
-                        Surface(
+                        Spacer(modifier = Modifier.width(8.dp))
+
+                        Button(
                             onClick = {
                                 if (nameInput.isNotBlank()) {
                                     onSave(nameInput.trim(), emailInput.trim(), phoneInput.trim())
                                     isEditing = false
                                 }
                             },
-                            shape = RoundedCornerShape(10.dp),
-                            color = SageGreen,
-                            shadowElevation = 6.dp,
-                            border = BorderStroke(1.dp, Color.White.copy(alpha = 0.3f))
+                            colors = ButtonDefaults.buttonColors(containerColor = SageGreen),
+                            shape = RoundedCornerShape(10.dp)
                         ) {
-                            Row(
-                                modifier = Modifier
-                                    .background(
-                                        androidx.compose.ui.graphics.Brush.verticalGradient(
-                                            colors = listOf(Color(0xFF34D399), Color(0xFF059669))
-                                        )
-                                    )
-                                    .padding(horizontal = 16.dp, vertical = 9.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(6.dp)
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Default.Check,
-                                    contentDescription = null,
-                                    tint = Color.White,
-                                    modifier = Modifier.size(16.dp)
-                                )
-                                Text(
-                                    text = "SAVE PERSON ${slotIndex + 1}",
-                                    color = Color.White,
-                                    fontSize = 12.sp,
-                                    fontWeight = FontWeight.ExtraBold,
-                                    letterSpacing = 0.5.sp
-                                )
-                            }
+                            Icon(imageVector = Icons.Default.Check, contentDescription = null, tint = Color.White, modifier = Modifier.size(16.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("Save Contact", color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Bold)
                         }
                     }
                 }
