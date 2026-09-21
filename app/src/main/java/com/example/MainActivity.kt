@@ -289,19 +289,22 @@ class SecureLegacyViewModel(application: Application) : AndroidViewModel(applica
 
         // Safely Initialize Firebase / Firestore
         try {
-            FirebaseApp.initializeApp(application)
+            if (FirebaseApp.getApps(application).isEmpty()) {
+                FirebaseApp.initializeApp(application)
+            }
             isFirebaseInitialized = true
             try {
                 val db = FirebaseFirestore.getInstance()
                 isFirestoreAvailable = true
                 firebaseSyncStatus = "Active & Synced with Firebase Cloud Console"
+                attachFirestoreListener()
                 loadFromFirestoreAndMerge()
             } catch (e: Exception) {
                 isFirestoreAvailable = false
                 if (isSimulationModeActive) {
                     firebaseSyncStatus = "Active (Simulated Cloud Sync Mode)"
                 } else {
-                    firebaseSyncStatus = "Local Mode (No Firebase configuration found)"
+                    firebaseSyncStatus = "Local Mode (${e.localizedMessage ?: "No Firebase configuration found"})"
                 }
             }
         } catch (e: Exception) {
@@ -310,8 +313,59 @@ class SecureLegacyViewModel(application: Application) : AndroidViewModel(applica
             if (isSimulationModeActive) {
                 firebaseSyncStatus = "Active (Simulated Cloud Sync Mode)"
             } else {
-                firebaseSyncStatus = "Local Mode (No Firebase configuration found)"
+                firebaseSyncStatus = "Local Mode (${e.localizedMessage ?: "No Firebase configuration found"})"
             }
+        }
+    }
+
+    fun getFirestoreDocId(): String {
+        val email = registeredEmail.trim().lowercase()
+        return if (email.isNotEmpty()) {
+            email.replace("/", "_")
+        } else {
+            "primary_user"
+        }
+    }
+
+    private var firestoreListener: com.google.firebase.firestore.ListenerRegistration? = null
+
+    fun attachFirestoreListener() {
+        if (!isFirestoreAvailable) return
+        firestoreListener?.remove()
+        val docId = getFirestoreDocId()
+        try {
+            val db = FirebaseFirestore.getInstance()
+            firestoreListener = db.collection("users").document(docId)
+                .addSnapshotListener { snapshot, error ->
+                    if (error != null) {
+                        return@addSnapshotListener
+                    }
+                    if (snapshot != null && snapshot.exists()) {
+                        try {
+                            val remoteVaultJson = snapshot.getString("vault_items_json")
+                            val remoteContactsJson = snapshot.getString("trusted_contacts_json")
+                            if (!remoteVaultJson.isNullOrEmpty()) {
+                                val remoteItems = parseVaultItemsFromJson(remoteVaultJson)
+                                if (remoteItems.isNotEmpty() && remoteItems != vaultItems) {
+                                    vaultItems = remoteItems
+                                    prefs.edit().putString("vault_items_json", remoteVaultJson).apply()
+                                }
+                            }
+                            if (!remoteContactsJson.isNullOrEmpty()) {
+                                val remoteContacts = parseTrustedContactsFromJson(remoteContactsJson)
+                                if (remoteContacts.isNotEmpty() && remoteContacts != trustedContacts) {
+                                    trustedContacts = remoteContacts
+                                    prefs.edit().putString("trusted_contacts_json", remoteContactsJson).apply()
+                                }
+                            }
+                            firebaseSyncStatus = "Active & Synced with Firebase Cloud Console"
+                        } catch (e: Exception) {
+                            e.printStackTrace()
+                        }
+                    }
+                }
+        } catch (e: Exception) {
+            e.printStackTrace()
         }
     }
 
@@ -332,6 +386,7 @@ class SecureLegacyViewModel(application: Application) : AndroidViewModel(applica
             array.put(obj)
         }
         prefs.edit().putString("vault_items_json", array.toString()).apply()
+        saveToFirestore()
     }
 
     fun loadVaultItems(): List<VaultItem> {
@@ -375,11 +430,13 @@ class SecureLegacyViewModel(application: Application) : AndroidViewModel(applica
                 put("name", contact.name)
                 put("relationship", contact.relationship)
                 put("email", contact.email)
+                put("phone", contact.phone)
                 put("tier", contact.tier.name)
             }
             array.put(obj)
         }
         prefs.edit().putString("trusted_contacts_json", array.toString()).apply()
+        saveToFirestore()
     }
 
     fun loadTrustedContacts(): List<TrustedContact> {
@@ -425,36 +482,40 @@ class SecureLegacyViewModel(application: Application) : AndroidViewModel(applica
 
     fun loadFromFirestoreAndMerge() {
         if (!isFirestoreAvailable) return
-        val email = registeredEmail.takeIf { it.isNotEmpty() } ?: "anonymous_user"
+        val docId = getFirestoreDocId()
         
-        val db = FirebaseFirestore.getInstance()
-        db.collection("users").document(email).get()
-            .addOnSuccessListener { document ->
-                if (document != null && document.exists()) {
-                    try {
-                        val firestoreVaultItemsJson = document.getString("vault_items_json")
-                        val firestoreTrustedContactsJson = document.getString("trusted_contacts_json")
-                        
-                        if (!firestoreVaultItemsJson.isNullOrEmpty()) {
-                            val items = parseVaultItemsFromJson(firestoreVaultItemsJson)
-                            if (items.isNotEmpty()) {
-                                vaultItems = items
-                                saveVaultItems(items)
+        try {
+            val db = FirebaseFirestore.getInstance()
+            db.collection("users").document(docId).get()
+                .addOnSuccessListener { document ->
+                    if (document != null && document.exists()) {
+                        try {
+                            val firestoreVaultItemsJson = document.getString("vault_items_json")
+                            val firestoreTrustedContactsJson = document.getString("trusted_contacts_json")
+                            
+                            if (!firestoreVaultItemsJson.isNullOrEmpty()) {
+                                val items = parseVaultItemsFromJson(firestoreVaultItemsJson)
+                                if (items.isNotEmpty()) {
+                                    vaultItems = items
+                                    prefs.edit().putString("vault_items_json", firestoreVaultItemsJson).apply()
+                                }
                             }
-                        }
-                        if (!firestoreTrustedContactsJson.isNullOrEmpty()) {
-                            val contacts = parseTrustedContactsFromJson(firestoreTrustedContactsJson)
-                            if (contacts.isNotEmpty()) {
-                                trustedContacts = contacts
-                                saveTrustedContacts(contacts)
+                            if (!firestoreTrustedContactsJson.isNullOrEmpty()) {
+                                val contacts = parseTrustedContactsFromJson(firestoreTrustedContactsJson)
+                                if (contacts.isNotEmpty()) {
+                                    trustedContacts = contacts
+                                    prefs.edit().putString("trusted_contacts_json", firestoreTrustedContactsJson).apply()
+                                }
                             }
+                            firebaseSyncStatus = "Active & Synced with Firebase Cloud Console"
+                        } catch (e: Exception) {
+                            e.printStackTrace()
                         }
-                        firebaseSyncStatus = "Active & Synced with Firebase Cloud Console"
-                    } catch (e: Exception) {
-                        e.printStackTrace()
                     }
                 }
-            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
     }
 
     fun saveToFirestore() {
@@ -463,28 +524,57 @@ class SecureLegacyViewModel(application: Application) : AndroidViewModel(applica
             return
         }
         if (!isFirestoreAvailable) return
-        val email = registeredEmail.takeIf { it.isNotEmpty() } ?: "anonymous_user"
+        val docId = getFirestoreDocId()
         
         val vaultItemsJson = getVaultItemsJson(vaultItems)
         val trustedContactsJson = getTrustedContactsJson(trustedContacts)
+
+        val vaultItemsList = vaultItems.map { item ->
+            hashMapOf(
+                "id" to item.id,
+                "title" to item.title,
+                "detail" to item.detail,
+                "category" to item.category.name,
+                "contactType" to (item.contactType ?: ""),
+                "assetType" to (item.assetType ?: ""),
+                "uploadedDocuments" to item.uploadedDocuments
+            )
+        }
+        val trustedContactsList = trustedContacts.map { contact ->
+            hashMapOf(
+                "name" to contact.name,
+                "relationship" to contact.relationship,
+                "email" to contact.email,
+                "phone" to contact.phone,
+                "tier" to contact.tier.name
+            )
+        }
         
         val data = hashMapOf(
             "registered_username" to registeredUsername,
             "registered_email" to registeredEmail,
             "registered_phone" to registeredPhone,
+            "vault_items" to vaultItemsList,
+            "trusted_contacts" to trustedContactsList,
             "vault_items_json" to vaultItemsJson,
             "trusted_contacts_json" to trustedContactsJson,
+            "items_count" to vaultItems.size,
+            "contacts_count" to trustedContacts.size,
             "last_synced_at" to System.currentTimeMillis()
         )
         
-        val db = FirebaseFirestore.getInstance()
-        db.collection("users").document(email).set(data)
-            .addOnSuccessListener {
-                firebaseSyncStatus = "Active & Synced with Firebase Cloud Console"
-            }
-            .addOnFailureListener { e ->
-                firebaseSyncStatus = "Sync failed: ${e.message}"
-            }
+        try {
+            val db = FirebaseFirestore.getInstance()
+            db.collection("users").document(docId).set(data)
+                .addOnSuccessListener {
+                    firebaseSyncStatus = "Active & Synced with Firebase Cloud Console"
+                }
+                .addOnFailureListener { e ->
+                    firebaseSyncStatus = "Sync status: ${e.message ?: "Retrying"}"
+                }
+        } catch (e: Exception) {
+            firebaseSyncStatus = "Local storage active (${e.localizedMessage ?: "Sync queued"})"
+        }
     }
 
     private fun getVaultItemsJson(items: List<VaultItem>): String {
@@ -644,6 +734,8 @@ class SecureLegacyViewModel(application: Application) : AndroidViewModel(applica
             "username" to user,
             "email" to emailAddr
         ))
+        attachFirestoreListener()
+        saveToFirestore()
     }
 
     var isLoggedIn by mutableStateOf(false)
@@ -1889,6 +1981,29 @@ fun FirebaseSyncDashboard(viewModel: SecureLegacyViewModel) {
                 fontFamily = FontFamily.Monospace,
                 color = if (viewModel.isFirestoreAvailable) SageGreen else InkNavy.copy(alpha = 0.8f)
             )
+
+            // Live Firestore target path
+            Spacer(modifier = Modifier.height(4.dp))
+            Surface(
+                color = Color(0x0C3E7C6B),
+                shape = RoundedCornerShape(6.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp)) {
+                    Text(
+                        text = "Firebase Project: amanat-a3b65",
+                        fontSize = 10.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = InkNavy
+                    )
+                    Text(
+                        text = "Firestore Document: users/${viewModel.getFirestoreDocId()}",
+                        fontSize = 10.sp,
+                        fontFamily = FontFamily.Monospace,
+                        color = TextDark
+                    )
+                }
+            }
 
             if (syncMessage.isNotEmpty()) {
                 Spacer(modifier = Modifier.height(4.dp))
