@@ -135,6 +135,16 @@ data class TrustedContact(
     val tier: AccessTier = AccessTier.FULL_ACCESS
 )
 
+data class TrusteeLoginRequest(
+    val id: String = java.util.UUID.randomUUID().toString(),
+    val trusteeContact: TrustedContact,
+    val requestTimestamp: Long = System.currentTimeMillis(),
+    var isApprovedByOwner: Boolean = false,
+    var approvedAt: Long? = null,
+    var accessLinkGenerated: String = "",
+    var is24HourElapsed: Boolean = false
+)
+
 data class AdminUser(
     val email: String,
     val password: String
@@ -260,6 +270,12 @@ class SecureLegacyViewModel(application: Application) : AndroidViewModel(applica
     var isSimulationModeActive by mutableStateOf(prefs.getBoolean("firebase_simulation_active", false))
     var firebaseSyncStatus by mutableStateOf("Not configured - Running locally")
 
+    // Trustee Direct Login & View Only State
+    var isTrusteeViewOnly by mutableStateOf(false)
+    var currentTrusteeName by mutableStateOf<String?>(null)
+    var currentTrusteeTier by mutableStateOf<AccessTier?>(null)
+    var pendingTrusteeLoginRequest by mutableStateOf<TrusteeLoginRequest?>(null)
+
     init {
         val serialized = prefs.getString("admin_users_list", null)
         val parsedList = if (!serialized.isNullOrEmpty()) {
@@ -285,7 +301,23 @@ class SecureLegacyViewModel(application: Application) : AndroidViewModel(applica
 
         // Load persisted vault items and trusted contacts
         vaultItems = loadVaultItems()
-        trustedContacts = loadTrustedContacts()
+        val loadedContacts = loadTrustedContacts()
+        if (loadedContacts.isEmpty()) {
+            // Provide initial default contact so nominee login can be tested right away
+            val defaultNominee = listOf(
+                TrustedContact(
+                    name = "Meenakshi Srivastava",
+                    relationship = "Nominee & Trustee",
+                    email = "meenakshi@amanat.com",
+                    phone = "9876543211",
+                    tier = AccessTier.FULL_ACCESS
+                )
+            )
+            trustedContacts = defaultNominee
+            saveTrustedContacts(defaultNominee)
+        } else {
+            trustedContacts = loadedContacts
+        }
 
         // Safely Initialize Firebase / Firestore
         try {
@@ -959,6 +991,72 @@ class SecureLegacyViewModel(application: Application) : AndroidViewModel(applica
     fun deleteTrustedContact(contactName: String) {
         trustedContacts = trustedContacts.filter { it.name != contactName }
         saveTrustedContacts(trustedContacts)
+    }
+
+    fun findTrusteeMatch(identifier: String): TrustedContact? {
+        val trimmed = identifier.trim()
+        if (trimmed.isEmpty()) return null
+        val cleanPhone = trimmed.replace(Regex("[^0-9]"), "")
+        return trustedContacts.firstOrNull { contact ->
+            contact.email.trim().equals(trimmed, ignoreCase = true) ||
+            (cleanPhone.isNotEmpty() && contact.phone.replace(Regex("[^0-9]"), "") == cleanPhone) ||
+            (cleanPhone.length >= 10 && contact.phone.contains(cleanPhone))
+        }
+    }
+
+    fun submitTrusteeLoginRequest(identifier: String): Pair<Boolean, String> {
+        val trimmed = identifier.trim()
+        if (trimmed.isEmpty()) {
+            return Pair(false, "Please enter your registered email address or mobile number.")
+        }
+        val match = findTrusteeMatch(trimmed)
+        if (match == null) {
+            return Pair(
+                false,
+                "No matching trusted contact found for '$trimmed'. Please ensure the vault owner has added you under 'Trusted Contacts'."
+            )
+        }
+
+        val token = java.util.UUID.randomUUID().toString().take(12)
+        val directLink = "https://amanat.app/trustee-vault?token=$token&trustee=${match.email.ifEmpty { match.phone }}"
+        val req = TrusteeLoginRequest(
+            trusteeContact = match,
+            requestTimestamp = System.currentTimeMillis(),
+            isApprovedByOwner = false,
+            accessLinkGenerated = directLink
+        )
+        pendingTrusteeLoginRequest = req
+
+        logAnalyticsEvent("trustee_login_request", mapOf(
+            "trustee_name" to match.name,
+            "trustee_identifier" to (match.email.ifEmpty { match.phone })
+        ))
+
+        return Pair(true, "Approval request dispatched to vault owner (${registeredEmail.ifEmpty { registeredUsername }}).")
+    }
+
+    fun approveTrusteeLoginRequest() {
+        val req = pendingTrusteeLoginRequest ?: return
+        req.isApprovedByOwner = true
+        req.approvedAt = System.currentTimeMillis()
+        pendingTrusteeLoginRequest = req
+
+        logAnalyticsEvent("trustee_request_approved", mapOf(
+            "trustee_name" to req.trusteeContact.name
+        ))
+    }
+
+    fun executeTrusteeLogin(contact: TrustedContact) {
+        viewingAs = contact.name
+        isTrusteeViewOnly = true
+        currentTrusteeName = contact.name
+        currentTrusteeTier = contact.tier
+        isLoggedIn = true
+
+        logAnalyticsEvent("trustee_login_success", mapOf(
+            "trustee_name" to contact.name,
+            "tier" to contact.tier.name
+        ))
     }
 
     fun resetRegistration() {
@@ -2212,12 +2310,12 @@ fun MyVaultScreen(viewModel: SecureLegacyViewModel) {
     val viewerContact = viewModel.trustedContacts.find { it.name == viewModel.viewingAs }
     val viewerTier = viewerContact?.tier
 
-    // Emergency Contacts visible if request exists
+    // Emergency Contacts visible if request exists or trustee is viewing
     val requestExists = viewModel.accessStatus != AccessStatus.NO_REQUEST && viewModel.accessStatus != AccessStatus.CANCELLED
-    val isEmergencyVisible = isOwner || requestExists
+    val isEmergencyVisible = isOwner || requestExists || viewModel.isTrusteeViewOnly
 
-    // All other categories unlocked ONLY if status is UNLOCKED and matches the access tier
-    val isUnlockedStatus = viewModel.accessStatus == AccessStatus.UNLOCKED
+    // All other categories unlocked ONLY if status is UNLOCKED or trustee is viewing and matches the access tier
+    val isUnlockedStatus = viewModel.accessStatus == AccessStatus.UNLOCKED || viewModel.isTrusteeViewOnly
     
     val bankingVisible = isOwner || (isUnlockedStatus && (viewerTier == AccessTier.FULL_ACCESS || viewerTier == AccessTier.FINANCIAL_ONLY))
     val insuranceVisible = isOwner || (isUnlockedStatus && viewerTier == AccessTier.FULL_ACCESS)
@@ -2237,6 +2335,49 @@ fun MyVaultScreen(viewModel: SecureLegacyViewModel) {
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
 
+            // Trustee Active Session Banner
+            if (viewModel.isTrusteeViewOnly) {
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(containerColor = Color(0xFF1E3A8A)),
+                    shape = RoundedCornerShape(12.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.padding(14.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Shield,
+                            contentDescription = "Trustee Active",
+                            tint = Color(0xFF93C5FD),
+                            modifier = Modifier.size(28.dp)
+                        )
+                        Spacer(modifier = Modifier.width(12.dp))
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "Trustee & Nominee Active Session",
+                                color = Color.White,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 14.sp
+                            )
+                            Text(
+                                text = "Viewing as ${viewModel.currentTrusteeName ?: viewModel.viewingAs} (${viewerTier?.displayName ?: "Authorized Access"}). Read-only mode.",
+                                color = Color(0xFFDBEAFE),
+                                fontSize = 11.sp
+                            )
+                        }
+                        TextButton(
+                            onClick = {
+                                viewModel.isLoggedIn = false
+                                viewModel.isTrusteeViewOnly = false
+                                viewModel.viewingAs = "Owner"
+                            }
+                        ) {
+                            Text("Exit / Logout", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                        }
+                    }
+                }
+            }
 
             // Category list
             VaultCategory.values().forEach { category ->
@@ -5629,6 +5770,94 @@ fun AccessActivityScreen(viewModel: SecureLegacyViewModel) {
             }
         }
 
+        // Owner Approval Card for Pending Trustee Direct Login Request
+        if (isOwner && viewModel.pendingTrusteeLoginRequest != null) {
+            val req = viewModel.pendingTrusteeLoginRequest!!
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(bottom = 16.dp),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFF0F172A)),
+                border = BorderStroke(1.5.dp, Color(0xFF2563EB)),
+                shape = RoundedCornerShape(12.dp)
+            ) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(
+                            imageVector = Icons.Default.NotificationsActive,
+                            contentDescription = null,
+                            tint = Color(0xFF60A5FA),
+                            modifier = Modifier.size(20.dp)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = "Trustee Direct Login Request Received",
+                            color = Color.White,
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 14.sp
+                        )
+                    }
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        text = "Your trusted nominee ${req.trusteeContact.name} (${req.trusteeContact.relationship}) requested direct login access via ${req.trusteeContact.email.ifEmpty { req.trusteeContact.phone }}.",
+                        color = Color.White.copy(alpha = 0.8f),
+                        fontSize = 12.sp
+                    )
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        text = "• Condition 1: Approve now to grant direct link immediately.\n• Condition 2: If you do not respond, system sends direct link automatically after 24 hours.",
+                        color = Color(0xFF93C5FD),
+                        fontSize = 11.sp
+                    )
+
+                    Spacer(modifier = Modifier.height(12.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        if (!req.isApprovedByOwner) {
+                            Button(
+                                onClick = { viewModel.approveTrusteeLoginRequest() },
+                                colors = ButtonDefaults.buttonColors(containerColor = SageGreen),
+                                shape = RoundedCornerShape(8.dp),
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Icon(Icons.Default.Check, contentDescription = null, modifier = Modifier.size(16.dp))
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text("Approve Request", fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                            }
+                        } else {
+                            Surface(
+                                color = SageGreen.copy(alpha = 0.2f),
+                                shape = RoundedCornerShape(8.dp),
+                                border = BorderStroke(1.dp, SageGreen),
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(vertical = 8.dp),
+                                    horizontalArrangement = Arrangement.Center,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Icon(Icons.Default.CheckCircle, contentDescription = null, tint = SageGreen, modifier = Modifier.size(16.dp))
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text("Approved", color = SageGreen, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                                }
+                            }
+                        }
+
+                        OutlinedButton(
+                            onClick = { viewModel.pendingTrusteeLoginRequest = null },
+                            colors = ButtonDefaults.outlinedButtonColors(contentColor = MutedRed),
+                            border = BorderStroke(1.dp, MutedRed),
+                            shape = RoundedCornerShape(8.dp)
+                        ) {
+                            Text("Dismiss", fontSize = 12.sp)
+                        }
+                    }
+                }
+            }
+        }
+
         // Upper Reset Control and Info Header
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -6342,6 +6571,7 @@ fun LoginScreen(viewModel: SecureLegacyViewModel) {
                 modifier = Modifier
                     .weight(1f)
                     .widthIn(max = 480.dp)
+                    .verticalScroll(rememberScrollState())
                     .padding(vertical = 16.dp),
                 horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.Center
@@ -6852,12 +7082,19 @@ fun GoogleLogoIcon(modifier: Modifier = Modifier) {
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun OwnerLoginLayout(viewModel: SecureLegacyViewModel) {
+    var selectedLoginMode by remember { mutableStateOf(0) } // 0: Owner Login, 1: Trustee Login
     var inputId by remember { mutableStateOf("") }
     var inputPassword by remember { mutableStateOf("") }
     var errorMessage by remember { mutableStateOf("") }
     var isPasswordVisible by remember { mutableStateOf(false) }
     var showForgotPasswordDialog by remember { mutableStateOf(false) }
     var showGoogleAccountChooser by remember { mutableStateOf(false) }
+
+    // Trustee states
+    var trusteeInput by remember { mutableStateOf("") }
+    var trusteeErrorMessage by remember { mutableStateOf("") }
+    var trusteeSuccessMessage by remember { mutableStateOf("") }
+    var fastForward24Hours by remember { mutableStateOf(false) }
 
     Column(
         modifier = Modifier
@@ -6867,301 +7104,782 @@ fun OwnerLoginLayout(viewModel: SecureLegacyViewModel) {
             .border(BorderStroke(1.dp, Color(0x11FFFFFF)), RoundedCornerShape(16.dp))
             .padding(16.dp)
     ) {
-        Text(
-            text = "User Login",
-            color = Color.White,
-            fontSize = 15.sp,
-            fontWeight = FontWeight.Bold,
-            fontFamily = FontFamily.Serif
-        )
-        Text(
-            text = "Enter your credentials to unlock your safe vault.",
-            color = Color.White.copy(alpha = 0.5f),
-            fontSize = 11.sp,
-            modifier = Modifier.padding(top = 2.dp, bottom = 16.dp)
-        )
-
-        // ID field
-        Text(
-            text = "USER NAME OR EMAIL ID",
-            color = Color.White.copy(alpha = 0.6f),
-            fontSize = 9.sp,
-            fontWeight = FontWeight.Bold,
-            fontFamily = FontFamily.SansSerif,
-            letterSpacing = 0.05.sp
-        )
-        Spacer(modifier = Modifier.height(4.dp))
-        OutlinedTextField(
-            value = inputId,
-            onValueChange = { inputId = it },
-            placeholder = { Text("Enter username or email", color = Color.White.copy(alpha = 0.3f), fontSize = 13.sp) },
-            modifier = Modifier
-                .fillMaxWidth()
-                .testTag("login_id_input"),
-            textStyle = MaterialTheme.typography.bodyMedium.copy(color = Color.White),
-            colors = OutlinedTextFieldDefaults.colors(
-                focusedBorderColor = SageGreen,
-                unfocusedBorderColor = Color.White.copy(alpha = 0.2f),
-                focusedTextColor = Color.White,
-                unfocusedTextColor = Color.White,
-                cursorColor = SageGreen
-            ),
-            shape = RoundedCornerShape(8.dp),
-            singleLine = true
-        )
-
-        Spacer(modifier = Modifier.height(12.dp))
-
-        // Password field
-        Text(
-            text = "PASSWORD",
-            color = Color.White.copy(alpha = 0.6f),
-            fontSize = 9.sp,
-            fontWeight = FontWeight.Bold,
-            fontFamily = FontFamily.SansSerif,
-            letterSpacing = 0.05.sp
-        )
-        Spacer(modifier = Modifier.height(4.dp))
-        OutlinedTextField(
-            value = inputPassword,
-            onValueChange = { inputPassword = it },
-            placeholder = { Text("Enter password", color = Color.White.copy(alpha = 0.3f), fontSize = 13.sp) },
-            modifier = Modifier
-                .fillMaxWidth()
-                .testTag("login_password_input"),
-            visualTransformation = if (isPasswordVisible) androidx.compose.ui.text.input.VisualTransformation.None else androidx.compose.ui.text.input.PasswordVisualTransformation(),
-            trailingIcon = {
-                IconButton(onClick = { isPasswordVisible = !isPasswordVisible }) {
-                    Icon(
-                        imageVector = if (isPasswordVisible) Icons.Default.Visibility else Icons.Default.VisibilityOff,
-                        contentDescription = "Toggle password visibility",
-                        tint = Color.White.copy(alpha = 0.5f)
-                    )
-                }
-            },
-            textStyle = MaterialTheme.typography.bodyMedium.copy(color = Color.White),
-            colors = OutlinedTextFieldDefaults.colors(
-                focusedBorderColor = SageGreen,
-                unfocusedBorderColor = Color.White.copy(alpha = 0.2f),
-                focusedTextColor = Color.White,
-                unfocusedTextColor = Color.White,
-                cursorColor = SageGreen
-            ),
-            shape = RoundedCornerShape(8.dp),
-            singleLine = true
-        )
-
-        if (errorMessage.isNotEmpty()) {
-            Spacer(modifier = Modifier.height(12.dp))
-            Text(
-                text = errorMessage,
-                color = MutedRed,
-                fontSize = 12.sp,
-                fontWeight = FontWeight.Bold
-            )
-        }
-
-        Spacer(modifier = Modifier.height(16.dp))
-
-        // Demo credential helper button
-        if (viewModel.isRegistered) {
-            Surface(
-                color = Color(0x1F3E7C6B),
-                shape = RoundedCornerShape(12.dp),
-                modifier = Modifier
-                    .clickable {
-                        inputId = viewModel.registeredUsername
-                        inputPassword = viewModel.registeredPassword
-                    }
-                    .padding(bottom = 12.dp)
-            ) {
-                Row(
-                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.Key,
-                        contentDescription = "Credential Helper",
-                        tint = SageGreen,
-                        modifier = Modifier.size(12.dp)
-                    )
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text(
-                        text = "Quick fill registered user (${viewModel.registeredUsername})",
-                        color = Color.White,
-                        fontSize = 10.sp,
-                        fontWeight = FontWeight.Bold
-                    )
-                }
-            }
-        } else {
-            // Suggest going to Register if not registered
-            Surface(
-                color = Color(0x1F3E7C6B),
-                shape = RoundedCornerShape(12.dp),
-                modifier = Modifier
-                    .clickable {
-                        viewModel.showRegistrationScreen = true
-                    }
-                    .padding(bottom = 12.dp)
-            ) {
-                Row(
-                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.PersonAdd,
-                        contentDescription = "Go Register",
-                        tint = SageGreen,
-                        modifier = Modifier.size(12.dp)
-                    )
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text(
-                        text = "No user registered yet. Tap to Register",
-                        color = Color.White,
-                        fontSize = 10.sp,
-                        fontWeight = FontWeight.Bold
-                    )
-                }
-            }
-        }
-
-        // Login Button
-        Button(
-            onClick = {
-                if (inputId.isEmpty() || inputPassword.isEmpty()) {
-                    errorMessage = "Please enter both ID and Password."
-                } else if (viewModel.isRegistered) {
-                    val matchUsername = inputId.trim().equals(viewModel.registeredUsername.trim(), ignoreCase = true)
-                    val matchEmail = inputId.trim().equals(viewModel.registeredEmail.trim(), ignoreCase = true)
-                    val matchPassword = inputPassword == viewModel.registeredPassword
-
-                    if ((matchUsername || matchEmail) && matchPassword) {
-                        viewModel.viewingAs = "Owner"
-                        viewModel.isLoggedIn = true
-                    } else {
-                        errorMessage = "Invalid credentials. Please try again."
-                    }
-                } else {
-                    // Fallback to admin/admin if no user is registered yet
-                    if (inputId == "admin" && inputPassword == "admin") {
-                        viewModel.viewingAs = "Owner"
-                        viewModel.isLoggedIn = true
-                    } else {
-                        errorMessage = "No registered user. Please register first."
-                    }
-                }
-            },
-            colors = ButtonDefaults.buttonColors(containerColor = SageGreen),
-            shape = RoundedCornerShape(8.dp),
-            modifier = Modifier
-                .fillMaxWidth()
-                .testTag("login_submit_button")
-        ) {
-            Icon(
-                imageVector = Icons.Default.LockOpen,
-                contentDescription = "Unlock",
-                modifier = Modifier.size(16.dp),
-                tint = Color.White
-            )
-            Spacer(modifier = Modifier.width(8.dp))
-            Text(
-                text = "Secure Login",
-                color = Color.White,
-                fontWeight = FontWeight.Bold,
-                fontSize = 13.sp
-            )
-        }
-
-        // OR Divider
+        // Prominent High-Contrast Mode Toggle: Owner Login vs Trustee Login
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(vertical = 12.dp),
-            verticalAlignment = Alignment.CenterVertically
+                .clip(RoundedCornerShape(12.dp))
+                .background(Color(0xFF0F172A))
+                .border(BorderStroke(1.dp, Color(0x33FFFFFF)), RoundedCornerShape(12.dp))
+                .padding(4.dp),
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
         ) {
-            HorizontalDivider(modifier = Modifier.weight(1f), color = Color.White.copy(alpha = 0.2f))
-            Text(
-                text = "  OR  ",
-                color = Color.White.copy(alpha = 0.5f),
-                fontSize = 10.sp,
-                fontWeight = FontWeight.Bold,
-                fontFamily = FontFamily.SansSerif
-            )
-            HorizontalDivider(modifier = Modifier.weight(1f), color = Color.White.copy(alpha = 0.2f))
-        }
-
-        // Direct Google Sign-In Button
-        Button(
-            onClick = { showGoogleAccountChooser = true },
-            colors = ButtonDefaults.buttonColors(containerColor = Color.White),
-            shape = RoundedCornerShape(8.dp),
-            border = BorderStroke(1.dp, Color(0xFFDADCE0)),
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(44.dp)
-                .testTag("google_login_button")
-        ) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.Center
+            Surface(
+                modifier = Modifier
+                    .weight(1f)
+                    .height(44.dp)
+                    .clip(RoundedCornerShape(9.dp))
+                    .clickable { selectedLoginMode = 0 },
+                color = if (selectedLoginMode == 0) SageGreen else Color.Transparent
             ) {
-                GoogleLogoIcon(modifier = Modifier.size(18.dp))
-                Spacer(modifier = Modifier.width(10.dp))
-                Text(
-                    text = "Sign in with Google",
-                    color = Color(0xFF3C4043),
-                    fontWeight = FontWeight.Bold,
-                    fontSize = 13.sp,
-                    fontFamily = FontFamily.SansSerif
-                )
+                Row(
+                    modifier = Modifier.fillMaxSize(),
+                    horizontalArrangement = Arrangement.Center,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Lock,
+                        contentDescription = "Owner Login Mode",
+                        tint = if (selectedLoginMode == 0) Color.White else Color(0xFF94A3B8),
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        text = "Owner Login",
+                        color = if (selectedLoginMode == 0) Color.White else Color(0xFF94A3B8),
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 13.sp
+                    )
+                }
+            }
+
+            Surface(
+                modifier = Modifier
+                    .weight(1f)
+                    .height(44.dp)
+                    .clip(RoundedCornerShape(9.dp))
+                    .clickable { selectedLoginMode = 1 },
+                color = if (selectedLoginMode == 1) Color(0xFF2563EB) else Color.Transparent
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxSize(),
+                    horizontalArrangement = Arrangement.Center,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Shield,
+                        contentDescription = "Trustee Login Mode",
+                        tint = if (selectedLoginMode == 1) Color.White else Color(0xFF94A3B8),
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        text = "Trustee Login",
+                        color = if (selectedLoginMode == 1) Color.White else Color(0xFF94A3B8),
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 13.sp
+                    )
+                }
             }
         }
 
         Spacer(modifier = Modifier.height(16.dp))
 
-        // Options Grid/Row for Register and Forgot Password (Admin Login removed as requested)
-        Column(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(10.dp)
-        ) {
-            // "Don't have an account? Register Now" Option
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.Center,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
+        if (selectedLoginMode == 0) {
+            // ==========================================
+            // OWNER LOGIN INTERFACE
+            // ==========================================
+            Text(
+                text = "User Login",
+                color = Color.White,
+                fontSize = 15.sp,
+                fontWeight = FontWeight.Bold,
+                fontFamily = FontFamily.Serif
+            )
+            Text(
+                text = "Enter your credentials to unlock your safe vault.",
+                color = Color.White.copy(alpha = 0.5f),
+                fontSize = 11.sp,
+                modifier = Modifier.padding(top = 2.dp, bottom = 16.dp)
+            )
+
+            // ID field
+            Text(
+                text = "USER NAME OR EMAIL ID",
+                color = Color.White.copy(alpha = 0.6f),
+                fontSize = 9.sp,
+                fontWeight = FontWeight.Bold,
+                fontFamily = FontFamily.SansSerif,
+                letterSpacing = 0.05.sp
+            )
+            Spacer(modifier = Modifier.height(4.dp))
+            OutlinedTextField(
+                value = inputId,
+                onValueChange = { inputId = it },
+                placeholder = { Text("Enter username or email", color = Color.White.copy(alpha = 0.3f), fontSize = 13.sp) },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("login_id_input"),
+                textStyle = MaterialTheme.typography.bodyMedium.copy(color = Color.White),
+                colors = OutlinedTextFieldDefaults.colors(
+                    focusedBorderColor = SageGreen,
+                    unfocusedBorderColor = Color.White.copy(alpha = 0.2f),
+                    focusedTextColor = Color.White,
+                    unfocusedTextColor = Color.White,
+                    cursorColor = SageGreen
+                ),
+                shape = RoundedCornerShape(8.dp),
+                singleLine = true
+            )
+
+            Spacer(modifier = Modifier.height(12.dp))
+
+            // Password field
+            Text(
+                text = "PASSWORD",
+                color = Color.White.copy(alpha = 0.6f),
+                fontSize = 9.sp,
+                fontWeight = FontWeight.Bold,
+                fontFamily = FontFamily.SansSerif,
+                letterSpacing = 0.05.sp
+            )
+            Spacer(modifier = Modifier.height(4.dp))
+            OutlinedTextField(
+                value = inputPassword,
+                onValueChange = { inputPassword = it },
+                placeholder = { Text("Enter password", color = Color.White.copy(alpha = 0.3f), fontSize = 13.sp) },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("login_password_input"),
+                visualTransformation = if (isPasswordVisible) androidx.compose.ui.text.input.VisualTransformation.None else androidx.compose.ui.text.input.PasswordVisualTransformation(),
+                trailingIcon = {
+                    IconButton(onClick = { isPasswordVisible = !isPasswordVisible }) {
+                        Icon(
+                            imageVector = if (isPasswordVisible) Icons.Default.Visibility else Icons.Default.VisibilityOff,
+                            contentDescription = "Toggle password visibility",
+                            tint = Color.White.copy(alpha = 0.5f)
+                        )
+                    }
+                },
+                textStyle = MaterialTheme.typography.bodyMedium.copy(color = Color.White),
+                colors = OutlinedTextFieldDefaults.colors(
+                    focusedBorderColor = SageGreen,
+                    unfocusedBorderColor = Color.White.copy(alpha = 0.2f),
+                    focusedTextColor = Color.White,
+                    unfocusedTextColor = Color.White,
+                    cursorColor = SageGreen
+                ),
+                shape = RoundedCornerShape(8.dp),
+                singleLine = true
+            )
+
+            if (errorMessage.isNotEmpty()) {
+                Spacer(modifier = Modifier.height(12.dp))
                 Text(
-                    text = "Don't have an account?",
-                    color = Color.White.copy(alpha = 0.6f),
+                    text = errorMessage,
+                    color = MutedRed,
                     fontSize = 12.sp,
-                    fontFamily = FontFamily.SansSerif
-                )
-                Spacer(modifier = Modifier.width(6.dp))
-                Text(
-                    text = "Register Now",
-                    color = SageGreen,
-                    fontSize = 12.sp,
-                    fontWeight = FontWeight.Bold,
-                    fontFamily = FontFamily.SansSerif,
-                    modifier = Modifier
-                        .clickable { viewModel.showRegistrationScreen = true }
-                        .testTag("login_register_link")
+                    fontWeight = FontWeight.Bold
                 )
             }
 
-            // Forgot Password link only
-            Text(
-                text = "Forgot Password?",
-                color = Color.White.copy(alpha = 0.6f),
-                fontSize = 12.sp,
-                fontWeight = FontWeight.Medium,
-                fontFamily = FontFamily.SansSerif,
+            Spacer(modifier = Modifier.height(16.dp))
+
+            // Demo credential helper button
+            if (viewModel.isRegistered) {
+                Surface(
+                    color = Color(0x1F3E7C6B),
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier
+                        .clickable {
+                            inputId = viewModel.registeredUsername
+                            inputPassword = viewModel.registeredPassword
+                        }
+                        .padding(bottom = 12.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Key,
+                            contentDescription = "Credential Helper",
+                            tint = SageGreen,
+                            modifier = Modifier.size(12.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = "Quick fill registered user (${viewModel.registeredUsername})",
+                            color = Color.White,
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                }
+            } else {
+                // Suggest going to Register if not registered
+                Surface(
+                    color = Color(0x1F3E7C6B),
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier
+                        .clickable {
+                            viewModel.showRegistrationScreen = true
+                        }
+                        .padding(bottom = 12.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.PersonAdd,
+                            contentDescription = "Go Register",
+                            tint = SageGreen,
+                            modifier = Modifier.size(12.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = "No user registered yet. Tap to Register",
+                            color = Color.White,
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                }
+            }
+
+            // Login Button
+            Button(
+                onClick = {
+                    if (inputId.isEmpty() || inputPassword.isEmpty()) {
+                        errorMessage = "Please enter both ID and Password."
+                    } else if (viewModel.isRegistered) {
+                        val matchUsername = inputId.trim().equals(viewModel.registeredUsername.trim(), ignoreCase = true)
+                        val matchEmail = inputId.trim().equals(viewModel.registeredEmail.trim(), ignoreCase = true)
+                        val matchPassword = inputPassword == viewModel.registeredPassword
+
+                        if ((matchUsername || matchEmail) && matchPassword) {
+                            viewModel.viewingAs = "Owner"
+                            viewModel.isTrusteeViewOnly = false
+                            viewModel.isLoggedIn = true
+                        } else {
+                            errorMessage = "Invalid credentials. Please try again."
+                        }
+                    } else {
+                        // Fallback to admin/admin if no user is registered yet
+                        if (inputId == "admin" && inputPassword == "admin") {
+                            viewModel.viewingAs = "Owner"
+                            viewModel.isTrusteeViewOnly = false
+                            viewModel.isLoggedIn = true
+                        } else {
+                            errorMessage = "No registered user. Please register first."
+                        }
+                    }
+                },
+                colors = ButtonDefaults.buttonColors(containerColor = SageGreen),
+                shape = RoundedCornerShape(8.dp),
                 modifier = Modifier
-                    .clickable { showForgotPasswordDialog = true }
-                    .testTag("forgot_password_link")
+                    .fillMaxWidth()
+                    .testTag("login_submit_button")
+            ) {
+                Icon(
+                    imageVector = Icons.Default.LockOpen,
+                    contentDescription = "Unlock",
+                    modifier = Modifier.size(16.dp),
+                    tint = Color.White
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(
+                    text = "Secure Login",
+                    color = Color.White,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 13.sp
+                )
+            }
+
+            // OR Divider
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 12.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                HorizontalDivider(modifier = Modifier.weight(1f), color = Color.White.copy(alpha = 0.2f))
+                Text(
+                    text = "  OR  ",
+                    color = Color.White.copy(alpha = 0.5f),
+                    fontSize = 10.sp,
+                    fontWeight = FontWeight.Bold,
+                    fontFamily = FontFamily.SansSerif
+                )
+                HorizontalDivider(modifier = Modifier.weight(1f), color = Color.White.copy(alpha = 0.2f))
+            }
+
+            // Direct Google Sign-In Button
+            Button(
+                onClick = { showGoogleAccountChooser = true },
+                colors = ButtonDefaults.buttonColors(containerColor = Color.White),
+                shape = RoundedCornerShape(8.dp),
+                border = BorderStroke(1.dp, Color(0xFFDADCE0)),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(44.dp)
+                    .testTag("google_login_button")
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.Center
+                ) {
+                    GoogleLogoIcon(modifier = Modifier.size(18.dp))
+                    Spacer(modifier = Modifier.width(10.dp))
+                    Text(
+                        text = "Sign in with Google",
+                        color = Color(0xFF3C4043),
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 13.sp,
+                        fontFamily = FontFamily.SansSerif
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(16.dp))
+
+            // Options Grid/Row for Register and Forgot Password
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                // "Don't have an account? Register Now" Option
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.Center,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "Don't have an account?",
+                        color = Color.White.copy(alpha = 0.6f),
+                        fontSize = 12.sp,
+                        fontFamily = FontFamily.SansSerif
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        text = "Register Now",
+                        color = SageGreen,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold,
+                        fontFamily = FontFamily.SansSerif,
+                        modifier = Modifier
+                            .clickable { viewModel.showRegistrationScreen = true }
+                            .testTag("login_register_link")
+                    )
+                }
+
+                // Forgot Password link only
+                Text(
+                    text = "Forgot Password?",
+                    color = Color.White.copy(alpha = 0.6f),
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Medium,
+                    fontFamily = FontFamily.SansSerif,
+                    modifier = Modifier
+                        .clickable { showForgotPasswordDialog = true }
+                        .testTag("forgot_password_link")
+                )
+
+                // Quick Switch to Trustee Login Helper Link
+                Spacer(modifier = Modifier.height(4.dp))
+                Surface(
+                    onClick = { selectedLoginMode = 1 },
+                    color = Color(0x1F2563EB),
+                    shape = RoundedCornerShape(10.dp),
+                    border = BorderStroke(1.dp, Color(0x443B82F6)),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.Center
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Shield,
+                            contentDescription = null,
+                            tint = Color(0xFF60A5FA),
+                            modifier = Modifier.size(14.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = "Are you a Nominee or Trustee? Switch to Trustee Login",
+                            color = Color(0xFF93C5FD),
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                    }
+                }
+            }
+        } else {
+            // ==========================================
+            // TRUSTEE & NOMINEE LOGIN INTERFACE
+            // ==========================================
+            Text(
+                text = "Trustee & Nominee Login",
+                color = Color.White,
+                fontSize = 15.sp,
+                fontWeight = FontWeight.Bold,
+                fontFamily = FontFamily.Serif
             )
+            Text(
+                text = "Enter your registered Email or Mobile Number as added by the vault owner in Trusted Contacts.",
+                color = Color.White.copy(alpha = 0.6f),
+                fontSize = 11.sp,
+                modifier = Modifier.padding(top = 2.dp, bottom = 14.dp)
+            )
+
+            // Email or Mobile Login input field
+            Text(
+                text = "EMAIL LOGIN OR MOBILE LOGIN",
+                color = Color(0xFF93C5FD),
+                fontSize = 9.sp,
+                fontWeight = FontWeight.Bold,
+                fontFamily = FontFamily.SansSerif,
+                letterSpacing = 0.05.sp
+            )
+            Spacer(modifier = Modifier.height(4.dp))
+            OutlinedTextField(
+                value = trusteeInput,
+                onValueChange = {
+                    trusteeInput = it
+                    trusteeErrorMessage = ""
+                },
+                placeholder = { Text("Enter trusted email or mobile number", color = Color.White.copy(alpha = 0.3f), fontSize = 12.sp) },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("trustee_id_input"),
+                textStyle = MaterialTheme.typography.bodyMedium.copy(color = Color.White),
+                leadingIcon = {
+                    Icon(
+                        imageVector = Icons.Default.Phone,
+                        contentDescription = "Contact info",
+                        tint = Color(0xFF60A5FA),
+                        modifier = Modifier.size(18.dp)
+                    )
+                },
+                colors = OutlinedTextFieldDefaults.colors(
+                    focusedBorderColor = Color(0xFF3B82F6),
+                    unfocusedBorderColor = Color.White.copy(alpha = 0.2f),
+                    focusedTextColor = Color.White,
+                    unfocusedTextColor = Color.White,
+                    cursorColor = Color(0xFF3B82F6)
+                ),
+                shape = RoundedCornerShape(8.dp),
+                singleLine = true
+            )
+
+            // Quick test contact chips
+            if (viewModel.trustedContacts.isNotEmpty()) {
+                Spacer(modifier = Modifier.height(10.dp))
+                Text(
+                    text = "RECOGNIZED TRUSTED CONTACTS (TAP TO FILL):",
+                    color = Color.White.copy(alpha = 0.5f),
+                    fontSize = 8.sp,
+                    fontWeight = FontWeight.Bold,
+                    fontFamily = FontFamily.SansSerif
+                )
+                Spacer(modifier = Modifier.height(4.dp))
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    viewModel.trustedContacts.forEach { contact ->
+                        val identifier = contact.email.ifEmpty { contact.phone }
+                        Surface(
+                            color = Color(0x221E3A8A),
+                            shape = RoundedCornerShape(8.dp),
+                            border = BorderStroke(1.dp, Color(0x3360A5FA)),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable {
+                                    trusteeInput = identifier
+                                    trusteeErrorMessage = ""
+                                }
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Person,
+                                    contentDescription = null,
+                                    tint = Color(0xFF93C5FD),
+                                    modifier = Modifier.size(14.dp)
+                                )
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text(
+                                    text = "${contact.name} (${contact.relationship}) • $identifier",
+                                    color = Color.White,
+                                    fontSize = 10.sp,
+                                    fontWeight = FontWeight.Medium
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (trusteeErrorMessage.isNotEmpty()) {
+                Spacer(modifier = Modifier.height(10.dp))
+                Text(
+                    text = trusteeErrorMessage,
+                    color = MutedRed,
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+
+            Spacer(modifier = Modifier.height(14.dp))
+
+            // Send Approval Request Button
+            Button(
+                onClick = {
+                    if (trusteeInput.isBlank()) {
+                        trusteeErrorMessage = "Please enter your registered email address or mobile number."
+                    } else {
+                        val result = viewModel.submitTrusteeLoginRequest(trusteeInput)
+                        if (!result.first) {
+                            trusteeErrorMessage = result.second
+                        } else {
+                            trusteeErrorMessage = ""
+                            trusteeSuccessMessage = result.second
+                        }
+                    }
+                },
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2563EB)),
+                shape = RoundedCornerShape(8.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("trustee_request_submit_button")
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Send,
+                    contentDescription = null,
+                    modifier = Modifier.size(16.dp),
+                    tint = Color.White
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(
+                    text = "Send Approval Request to Owner",
+                    color = Color.White,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 13.sp
+                )
+            }
+
+            // Active Request Status Card
+            val req = viewModel.pendingTrusteeLoginRequest
+            if (req != null) {
+                Spacer(modifier = Modifier.height(14.dp))
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(containerColor = Color(0xFF0F172A)),
+                    border = BorderStroke(1.dp, Color(0xFF3B82F6).copy(alpha = 0.5f)),
+                    shape = RoundedCornerShape(12.dp)
+                ) {
+                    Column(modifier = Modifier.padding(14.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(
+                                imageVector = Icons.Default.NotificationsActive,
+                                contentDescription = null,
+                                tint = Color(0xFF60A5FA),
+                                modifier = Modifier.size(18.dp)
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text(
+                                text = "Approval Workflow Active",
+                                color = Color.White,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 13.sp
+                            )
+                        }
+                        Text(
+                            text = "Trustee: ${req.trusteeContact.name} (${req.trusteeContact.relationship} • ${req.trusteeContact.tier.displayName})",
+                            color = Color.White.copy(alpha = 0.7f),
+                            fontSize = 11.sp,
+                            modifier = Modifier.padding(top = 2.dp, bottom = 10.dp)
+                        )
+
+                        HorizontalDivider(color = Color.White.copy(alpha = 0.1f))
+                        Spacer(modifier = Modifier.height(10.dp))
+
+                        // Condition 1: Owner Approval
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = "Condition 1: Owner Approval",
+                                    color = if (req.isApprovedByOwner) SageGreen else Color.White,
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 11.sp
+                                )
+                                Text(
+                                    text = if (req.isApprovedByOwner)
+                                        "Owner approved your request. Direct access granted!"
+                                    else
+                                        "Approval message dispatched to vault owner.",
+                                    color = Color.White.copy(alpha = 0.6f),
+                                    fontSize = 10.sp
+                                )
+                            }
+                            if (req.isApprovedByOwner) {
+                                Surface(
+                                    color = SageGreen.copy(alpha = 0.2f),
+                                    shape = RoundedCornerShape(6.dp),
+                                    border = BorderStroke(1.dp, SageGreen)
+                                ) {
+                                    Text(
+                                        text = "APPROVED",
+                                        color = SageGreen,
+                                        fontSize = 9.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                    )
+                                }
+                            } else {
+                                Button(
+                                    onClick = { viewModel.approveTrusteeLoginRequest() },
+                                    colors = ButtonDefaults.buttonColors(containerColor = SageGreen),
+                                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+                                    modifier = Modifier.height(32.dp)
+                                ) {
+                                    Text("Simulate Owner Approve", fontSize = 9.sp, fontWeight = FontWeight.Bold)
+                                }
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.height(10.dp))
+                        HorizontalDivider(color = Color.White.copy(alpha = 0.1f))
+                        Spacer(modifier = Modifier.height(10.dp))
+
+                        // Condition 2: 24-Hour Timelock Safety Bypass
+                        val is24hTriggered = fastForward24Hours || req.is24HourElapsed
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = "Condition 2: 24-Hour Safety Protocol",
+                                    color = if (is24hTriggered) Color(0xFFF59E0B) else Color.White,
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 11.sp
+                                )
+                                Text(
+                                    text = if (is24hTriggered)
+                                        "24 hours elapsed without owner response. Safety link delivered!"
+                                    else
+                                        "If owner does not respond within 24h, link is sent automatically.",
+                                    color = Color.White.copy(alpha = 0.6f),
+                                    fontSize = 10.sp
+                                )
+                            }
+                            if (is24hTriggered) {
+                                Surface(
+                                    color = Color(0x33F59E0B),
+                                    shape = RoundedCornerShape(6.dp),
+                                    border = BorderStroke(1.dp, Color(0xFFF59E0B))
+                                ) {
+                                    Text(
+                                        text = "24H ELAPSED",
+                                        color = Color(0xFFF59E0B),
+                                        fontSize = 9.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                    )
+                                }
+                            } else {
+                                OutlinedButton(
+                                    onClick = { fastForward24Hours = true },
+                                    colors = ButtonDefaults.outlinedButtonColors(contentColor = Color(0xFFF59E0B)),
+                                    border = BorderStroke(1.dp, Color(0xFFF59E0B)),
+                                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+                                    modifier = Modifier.height(32.dp)
+                                ) {
+                                    Text("Fast-Forward 24h", fontSize = 9.sp, fontWeight = FontWeight.Bold)
+                                }
+                            }
+                        }
+
+                        // Direct Login Link (Unlocked by Condition 1 OR Condition 2)
+                        if (req.isApprovedByOwner || is24hTriggered) {
+                            Spacer(modifier = Modifier.height(14.dp))
+                            Card(
+                                colors = CardDefaults.cardColors(containerColor = Color(0xFF064E3B)),
+                                border = BorderStroke(1.dp, SageGreen),
+                                shape = RoundedCornerShape(10.dp),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Column(modifier = Modifier.padding(12.dp)) {
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Icon(Icons.Default.CheckCircle, contentDescription = null, tint = SageGreen, modifier = Modifier.size(16.dp))
+                                        Spacer(modifier = Modifier.width(6.dp))
+                                        Text(
+                                            text = "Direct Login Link Ready",
+                                            color = Color.White,
+                                            fontWeight = FontWeight.Bold,
+                                            fontSize = 12.sp
+                                        )
+                                    }
+                                    Spacer(modifier = Modifier.height(4.dp))
+                                    Text(
+                                        text = req.accessLinkGenerated,
+                                        color = Color(0xFFA7F3D0),
+                                        fontSize = 9.sp,
+                                        fontFamily = FontFamily.Monospace,
+                                        modifier = Modifier.padding(vertical = 4.dp)
+                                    )
+                                    Spacer(modifier = Modifier.height(6.dp))
+                                    Button(
+                                        onClick = {
+                                            viewModel.executeTrusteeLogin(req.trusteeContact)
+                                        },
+                                        colors = ButtonDefaults.buttonColors(containerColor = SageGreen),
+                                        shape = RoundedCornerShape(8.dp),
+                                        modifier = Modifier.fillMaxWidth()
+                                    ) {
+                                        Icon(Icons.Default.LockOpen, contentDescription = null, tint = Color.White, modifier = Modifier.size(16.dp))
+                                        Spacer(modifier = Modifier.width(8.dp))
+                                        Text(
+                                            text = "Direct Login as Trustee & View Vault",
+                                            color = Color.White,
+                                            fontWeight = FontWeight.Bold,
+                                            fontSize = 12.sp
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(14.dp))
+            Surface(
+                onClick = { selectedLoginMode = 0 },
+                color = Color(0x1F3E7C6B),
+                shape = RoundedCornerShape(10.dp),
+                border = BorderStroke(1.dp, Color(0x443E7C6B)),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.Center
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Lock,
+                        contentDescription = null,
+                        tint = SageGreen,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = "Vault Owner? Switch to Owner Login",
+                        color = Color.White,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
+            }
         }
     }
 
