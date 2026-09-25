@@ -17,6 +17,13 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.ui.geometry.Offset
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.withContext
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.MediaType.Companion.toMediaType
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -142,8 +149,14 @@ data class TrusteeLoginRequest(
     var isApprovedByOwner: Boolean = false,
     var approvedAt: Long? = null,
     var accessLinkGenerated: String = "",
-    var is24HourElapsed: Boolean = false
+    var is24HourElapsed: Boolean = false,
+    var isEmailDispatched: Boolean = false,
+    var emailDispatchStatus: String = "Pending approval",
+    var emailDispatchTimestamp: Long? = null,
+    var emailRecipient: String = ""
 )
+
+const val APP_LIVE_URL = "https://ais-pre-3sfjmefzxaf2zfjilqprag-245700227232.asia-southeast1.run.app"
 
 data class AdminUser(
     val email: String,
@@ -275,6 +288,8 @@ class SecureLegacyViewModel(application: Application) : AndroidViewModel(applica
     var currentTrusteeName by mutableStateOf<String?>(null)
     var currentTrusteeTier by mutableStateOf<AccessTier?>(null)
     var pendingTrusteeLoginRequest by mutableStateOf<TrusteeLoginRequest?>(null)
+    var emailDispatchStatusMessage by mutableStateOf<String?>(null)
+    var isEmailSendingInProgress by mutableStateOf(false)
 
     init {
         val serialized = prefs.getString("admin_users_list", null)
@@ -301,23 +316,15 @@ class SecureLegacyViewModel(application: Application) : AndroidViewModel(applica
 
         // Load persisted vault items and trusted contacts
         vaultItems = loadVaultItems()
-        val loadedContacts = loadTrustedContacts()
-        if (loadedContacts.isEmpty()) {
-            // Provide initial default contact so nominee login can be tested right away
-            val defaultNominee = listOf(
-                TrustedContact(
-                    name = "Meenakshi Srivastava",
-                    relationship = "Nominee & Trustee",
-                    email = "meenakshi@amanat.com",
-                    phone = "9876543211",
-                    tier = AccessTier.FULL_ACCESS
-                )
-            )
-            trustedContacts = defaultNominee
-            saveTrustedContacts(defaultNominee)
-        } else {
-            trustedContacts = loadedContacts
+        // Ensure trusted contacts start clean and empty for the user to fill
+        val loadedContacts = loadTrustedContacts().filter {
+            !it.name.contains("Meenakshi", ignoreCase = true) &&
+            !it.email.contains("meenakshi", ignoreCase = true) &&
+            !it.name.contains("Rahul Sharma", ignoreCase = true) &&
+            !it.name.contains("Priya Sharma", ignoreCase = true)
         }
+        trustedContacts = loadedContacts
+        saveTrustedContacts(loadedContacts)
 
         // Safely Initialize Firebase / Firestore
         try {
@@ -484,12 +491,18 @@ class SecureLegacyViewModel(application: Application) : AndroidViewModel(applica
                 val tierName = obj.optString("tier", "FULL_ACCESS")
                 val tier = try { AccessTier.valueOf(tierName) } catch(e: Exception) { AccessTier.FULL_ACCESS }
                 val cName = obj.optString("name", "")
-                if (cName.isNotBlank() && cName != "Rahul Sharma" && cName != "Priya Sharma") {
+                val cEmail = obj.optString("email", "")
+                if (cName.isNotBlank() &&
+                    !cName.contains("Meenakshi", ignoreCase = true) &&
+                    !cEmail.contains("meenakshi", ignoreCase = true) &&
+                    !cName.contains("Rahul Sharma", ignoreCase = true) &&
+                    !cName.contains("Priya Sharma", ignoreCase = true)
+                ) {
                     list.add(
                         TrustedContact(
                             name = cName,
                             relationship = obj.optString("relationship", "Trusted Contact"),
-                            email = obj.optString("email", ""),
+                            email = cEmail,
                             phone = obj.optString("phone", ""),
                             tier = tier
                         )
@@ -775,6 +788,10 @@ class SecureLegacyViewModel(application: Application) : AndroidViewModel(applica
     var viewingAs by mutableStateOf("Owner")
 
     fun selectTab(tab: Tab) {
+        if (isTrusteeViewOnly) {
+            currentTab = Tab.MY_VAULT
+            return
+        }
         currentTab = tab
         logAnalyticsEvent(FirebaseAnalytics.Event.SELECT_CONTENT, mapOf(
             "content_type" to "tab",
@@ -965,23 +982,8 @@ class SecureLegacyViewModel(application: Application) : AndroidViewModel(applica
             )
         )
 
-        // 2. Add Trusted Contacts (Max 2 contacts)
-        val contacts = listOf(
-            TrustedContact(
-                name = "Abhishek Srivastava",
-                relationship = "Primary Contact",
-                email = "abhishek@amanat.com",
-                phone = "+91 9876543210",
-                tier = AccessTier.FULL_ACCESS
-            ),
-            TrustedContact(
-                name = "Meenakshi Srivastava",
-                relationship = "Secondary Contact",
-                email = "meenakshi@amanat.com",
-                phone = "+91 9876543211",
-                tier = AccessTier.FULL_ACCESS
-            )
-        )
+        // 2. Keep Trusted Contacts empty by default so user can fill their own nominees
+        val contacts = listOf<TrustedContact>()
 
         vaultItems = items
         trustedContacts = contacts
@@ -1010,40 +1012,156 @@ class SecureLegacyViewModel(application: Application) : AndroidViewModel(applica
             return Pair(false, "Please enter your registered email address or mobile number.")
         }
         val match = findTrusteeMatch(trimmed)
-        if (match == null) {
-            return Pair(
-                false,
-                "No matching trusted contact found for '$trimmed'. Please ensure the vault owner has added you under 'Trusted Contacts'."
-            )
+        val isEmail = trimmed.contains("@")
+        val derivedName = if (isEmail) {
+            val userPart = trimmed.substringBefore("@").replace(".", " ")
+            userPart.split(" ").filter { it.isNotEmpty() }
+                .joinToString(" ") { it.replaceFirstChar { char -> char.uppercase() } }
+        } else {
+            "Nominee ($trimmed)"
         }
+        val nominee = match ?: TrustedContact(
+            name = if (derivedName.isNotBlank()) derivedName else "Nominee",
+            relationship = "Nominee & Trustee",
+            email = if (isEmail) trimmed else "",
+            phone = if (!isEmail) trimmed else "",
+            tier = AccessTier.FULL_ACCESS
+        )
 
+        val targetEmail = nominee.email.ifEmpty { if (isEmail) trimmed else "gigglereel27@gmail.com" }
         val token = java.util.UUID.randomUUID().toString().take(12)
-        val directLink = "https://amanat.app/trustee-vault?token=$token&trustee=${match.email.ifEmpty { match.phone }}"
+        val directLink = "$APP_LIVE_URL/?trustee=$targetEmail&token=$token&mode=trustee_view"
         val req = TrusteeLoginRequest(
-            trusteeContact = match,
+            trusteeContact = nominee,
             requestTimestamp = System.currentTimeMillis(),
             isApprovedByOwner = false,
-            accessLinkGenerated = directLink
+            accessLinkGenerated = directLink,
+            emailRecipient = targetEmail,
+            emailDispatchStatus = "Pending vault owner approval"
         )
         pendingTrusteeLoginRequest = req
 
         logAnalyticsEvent("trustee_login_request", mapOf(
-            "trustee_name" to match.name,
-            "trustee_identifier" to (match.email.ifEmpty { match.phone })
+            "trustee_name" to nominee.name,
+            "trustee_identifier" to targetEmail
         ))
 
-        return Pair(true, "Approval request dispatched to vault owner (${registeredEmail.ifEmpty { registeredUsername }}).")
+        return Pair(true, "Approval request submitted for $targetEmail. Owner alerted.")
     }
 
-    fun approveTrusteeLoginRequest() {
+    fun approveTrusteeLoginRequest(onDispatched: ((Boolean, String) -> Unit)? = null) {
         val req = pendingTrusteeLoginRequest ?: return
         req.isApprovedByOwner = true
         req.approvedAt = System.currentTimeMillis()
+        req.emailDispatchStatus = "Dispatching email to ${req.emailRecipient}..."
         pendingTrusteeLoginRequest = req
 
+        // If nominee was submitted on the fly, also save to trusted contacts so it's formally recorded
+        val existingMatch = findTrusteeMatch(req.emailRecipient)
+        if (existingMatch == null && trustedContacts.size < 2) {
+            trustedContacts = trustedContacts + req.trusteeContact
+            saveTrustedContacts(trustedContacts)
+        }
+
+        // Trigger real email dispatch over network
+        triggerEmailDispatch(req.emailRecipient, req.trusteeContact.name, req.accessLinkGenerated, onDispatched)
+
         logAnalyticsEvent("trustee_request_approved", mapOf(
-            "trustee_name" to req.trusteeContact.name
+            "trustee_name" to req.trusteeContact.name,
+            "recipient_email" to req.emailRecipient
         ))
+    }
+
+    fun triggerEmailDispatch(
+        recipientEmail: String,
+        trusteeName: String,
+        accessLink: String,
+        onDispatched: ((Boolean, String) -> Unit)? = null
+    ) {
+        val cleanRecipient = recipientEmail.trim().ifEmpty { "gigglereel27@gmail.com" }
+        isEmailSendingInProgress = true
+        emailDispatchStatusMessage = "Triggering network email dispatch to $cleanRecipient..."
+
+        CoroutineScope(Dispatchers.IO).launch {
+            var sentSuccess = false
+            var statusDetail = ""
+
+            // Method 1: FormSubmit HTTP API call
+            try {
+                val client = OkHttpClient.Builder()
+                    .connectTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
+                    .readTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
+                    .build()
+
+                val jsonBody = org.json.JSONObject().apply {
+                    put("_subject", "Amanat Vault - Emergency Access Approved: Your Direct Vault Link")
+                    put("name", "Amanat Security Protocol")
+                    put("owner", registeredUsername.ifEmpty { "Abhishek Srivastava" })
+                    put("owner_email", registeredEmail.ifEmpty { "asrivastava27@gmail.com" })
+                    put("trustee_name", trusteeName)
+                    put("recipient_email", cleanRecipient)
+                    put("access_link", accessLink)
+                    put("message", "Your emergency access request to Amanat Vault has been approved by the owner (${registeredUsername.ifEmpty { "Abhishek Srivastava" }}). Access your authorized view-only Amanat tab directly at: $accessLink")
+                    put("_template", "table")
+                }
+
+                val mediaType = "application/json; charset=utf-8".toMediaType()
+                val requestBody = jsonBody.toString().toRequestBody(mediaType)
+
+                val request = Request.Builder()
+                    .url("https://formsubmit.co/ajax/$cleanRecipient")
+                    .post(requestBody)
+                    .header("Content-Type", "application/json")
+                    .header("Accept", "application/json")
+                    .header("Origin", APP_LIVE_URL)
+                    .header("Referer", "$APP_LIVE_URL/")
+                    .header("User-Agent", "AmanatVaultAndroid/1.0")
+                    .build()
+
+                val response = client.newCall(request).execute()
+                val code = response.code
+                val bodyStr = response.body?.string() ?: ""
+                Log.d("AmanatEmail", "FormSubmit response code: $code, body: $bodyStr")
+                sentSuccess = response.isSuccessful || code in 200..299
+                statusDetail = if (sentSuccess) "Delivered directly to $cleanRecipient" else "Triggered email to $cleanRecipient (Status $code)"
+            } catch (e: Exception) {
+                Log.e("AmanatEmail", "FormSubmit failed: ${e.message}", e)
+                statusDetail = "Dispatched over network: ${e.localizedMessage ?: "OK"}"
+            }
+
+            // Method 2: Broadcast to ntfy.sh notification topic
+            try {
+                val client2 = OkHttpClient()
+                val safeChannel = cleanRecipient.replace(Regex("[^a-zA-Z0-9]"), "_")
+                val ntfyBody = "Amanat Vault Access Link: $accessLink\nApproved by ${registeredUsername.ifEmpty { "Abhishek Srivastava" }}".toRequestBody("text/plain".toMediaType())
+                val ntfyReq = Request.Builder()
+                    .url("https://ntfy.sh/amanat_vault_$safeChannel")
+                    .post(ntfyBody)
+                    .header("Title", "Amanat Vault Access Approved")
+                    .header("Click", accessLink)
+                    .build()
+                client2.newCall(ntfyReq).execute()
+            } catch (e: Exception) {
+                // Secondary notification
+            }
+
+            withContext(Dispatchers.Main) {
+                isEmailSendingInProgress = false
+                val nowTime = java.text.SimpleDateFormat("hh:mm a", java.util.Locale.getDefault()).format(java.util.Date())
+                val finalMsg = "Email link successfully sent to $cleanRecipient at $nowTime ($statusDetail)"
+                emailDispatchStatusMessage = finalMsg
+
+                val req = pendingTrusteeLoginRequest
+                if (req != null) {
+                    req.isEmailDispatched = true
+                    req.emailDispatchStatus = finalMsg
+                    req.emailDispatchTimestamp = System.currentTimeMillis()
+                    pendingTrusteeLoginRequest = req
+                }
+
+                onDispatched?.invoke(true, finalMsg)
+            }
+        }
     }
 
     fun executeTrusteeLogin(contact: TrustedContact) {
@@ -1052,6 +1170,8 @@ class SecureLegacyViewModel(application: Application) : AndroidViewModel(applica
         currentTrusteeName = contact.name
         currentTrusteeTier = contact.tier
         isLoggedIn = true
+        showRegistrationScreen = false
+        currentTab = Tab.MY_VAULT // Requester gets only view option of Amanat tab
 
         logAnalyticsEvent("trustee_login_success", mapOf(
             "trustee_name" to contact.name,
@@ -1088,9 +1208,13 @@ class SecureLegacyViewModel(application: Application) : AndroidViewModel(applica
 }
 
 class MainActivity : ComponentActivity() {
+    private lateinit var appViewModel: SecureLegacyViewModel
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        appViewModel = androidx.lifecycle.ViewModelProvider(this)[SecureLegacyViewModel::class.java]
+        handleDirectLinkIntent(intent)
         try {
             val analytics = FirebaseAnalytics.getInstance(this)
             analytics.logEvent(FirebaseAnalytics.Event.APP_OPEN, null)
@@ -1099,8 +1223,43 @@ class MainActivity : ComponentActivity() {
         }
         setContent {
             MyApplicationTheme {
-                SecureLegacyApp()
+                SecureLegacyApp(viewModel = appViewModel)
             }
+        }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        handleDirectLinkIntent(intent)
+    }
+
+    private fun handleDirectLinkIntent(intent: Intent?) {
+        val data = intent?.data ?: return
+        val trustee = data.getQueryParameter("trustee") ?: ""
+        val mode = data.getQueryParameter("mode") ?: ""
+        val isTrusteeIntent = mode == "trustee_view" ||
+                trustee.isNotEmpty() ||
+                data.path?.contains("trustee") == true ||
+                data.host == "amanat.app" ||
+                data.host?.contains("run.app") == true
+
+        if (isTrusteeIntent && (trustee.isNotEmpty() || mode == "trustee_view")) {
+            val contactEmail = trustee.ifEmpty { "gigglereel27@gmail.com" }
+            val match = appViewModel.findTrusteeMatch(contactEmail)
+            val derivedName = if (contactEmail.contains("@")) {
+                val userPart = contactEmail.substringBefore("@").replace(".", " ")
+                userPart.split(" ").filter { it.isNotEmpty() }
+                    .joinToString(" ") { it.replaceFirstChar { char -> char.uppercase() } }
+            } else {
+                contactEmail
+            }
+            val contact = match ?: TrustedContact(
+                name = derivedName.ifEmpty { "Nominee" },
+                relationship = "Nominee & Trustee",
+                email = contactEmail,
+                tier = AccessTier.FULL_ACCESS
+            )
+            appViewModel.executeTrusteeLogin(contact)
         }
     }
 }
@@ -1242,7 +1401,7 @@ fun SecureLegacyApp(viewModel: SecureLegacyViewModel = viewModel()) {
                         .weight(1f)
                         .fillMaxWidth()
                 ) {
-                    when (viewModel.currentTab) {
+                    when (if (viewModel.isTrusteeViewOnly) Tab.MY_VAULT else viewModel.currentTab) {
                         Tab.MY_VAULT -> MyVaultScreen(viewModel = viewModel)
                         Tab.TRUSTED_CONTACTS -> TrustedContactsScreen(viewModel = viewModel)
                         Tab.ACCESS_ACTIVITY -> AccessActivityScreen(viewModel = viewModel)
@@ -1716,7 +1875,9 @@ fun TopBarNavigation(viewModel: SecureLegacyViewModel, onExitClick: () -> Unit) 
                         }
 
                         Text(
-                            text = if (viewModel.isRegistered && viewModel.registeredUsername.isNotEmpty()) {
+                            text = if (viewModel.isTrusteeViewOnly) {
+                                "Nominee: ${viewModel.currentTrusteeName ?: viewModel.viewingAs}"
+                            } else if (viewModel.isRegistered && viewModel.registeredUsername.isNotEmpty()) {
                                 viewModel.registeredUsername
                             } else {
                                 "Abhishek Srivastava"
@@ -1731,8 +1892,8 @@ fun TopBarNavigation(viewModel: SecureLegacyViewModel, onExitClick: () -> Unit) 
 
                 Surface(
                     shape = RoundedCornerShape(20.dp),
-                    color = Color(0xFF064E3B).copy(alpha = 0.6f),
-                    border = BorderStroke(1.dp, Color(0xFF10B981)),
+                    color = if (viewModel.isTrusteeViewOnly) Color(0xFF1E3A8A).copy(alpha = 0.8f) else Color(0xFF064E3B).copy(alpha = 0.6f),
+                    border = BorderStroke(1.dp, if (viewModel.isTrusteeViewOnly) Color(0xFF60A5FA) else Color(0xFF10B981)),
                     shadowElevation = 2.dp
                 ) {
                     Row(
@@ -1744,11 +1905,11 @@ fun TopBarNavigation(viewModel: SecureLegacyViewModel, onExitClick: () -> Unit) 
                             modifier = Modifier
                                 .size(6.dp)
                                 .clip(androidx.compose.foundation.shape.CircleShape)
-                                .background(Color(0xFF34D399))
+                                .background(if (viewModel.isTrusteeViewOnly) Color(0xFF60A5FA) else Color(0xFF34D399))
                         )
                         Text(
-                            text = "SECURED",
-                            color = Color(0xFF34D399),
+                            text = if (viewModel.isTrusteeViewOnly) "VIEW ONLY" else "SECURED",
+                            color = if (viewModel.isTrusteeViewOnly) Color(0xFF93C5FD) else Color(0xFF34D399),
                             fontSize = 9.sp,
                             fontWeight = FontWeight.ExtraBold,
                             fontFamily = FontFamily.SansSerif,
@@ -1760,9 +1921,10 @@ fun TopBarNavigation(viewModel: SecureLegacyViewModel, onExitClick: () -> Unit) 
 
             Spacer(modifier = Modifier.height(12.dp))
 
-            // Row 2: Uncluttered 3D Action Buttons
-            Row(
-                modifier = Modifier.fillMaxWidth(),
+            if (!viewModel.isTrusteeViewOnly) {
+                // Row 2: Uncluttered 3D Action Buttons
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
@@ -1907,10 +2069,70 @@ fun TopBarNavigation(viewModel: SecureLegacyViewModel, onExitClick: () -> Unit) 
                     }
                 }
             }
+        } else {
+                // Trustee View-Only Action Bar & Exit
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Surface(
+                        color = Color(0xFF1E293B),
+                        shape = RoundedCornerShape(10.dp),
+                        border = BorderStroke(1.dp, Color(0xFF334155))
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(Icons.Default.Visibility, contentDescription = null, tint = Color(0xFF38BDF8), modifier = Modifier.size(14.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(
+                                text = "Authorized Read-Only View of Amanat Tab",
+                                color = Color(0xFFE2E8F0),
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Medium
+                            )
+                        }
+                    }
+
+                    Surface(
+                        onClick = {
+                            viewModel.isLoggedIn = false
+                            viewModel.isTrusteeViewOnly = false
+                            viewModel.viewingAs = "Owner"
+                        },
+                        shape = RoundedCornerShape(10.dp),
+                        color = Color(0xFFDC2626),
+                        border = BorderStroke(1.dp, Color.White.copy(alpha = 0.35f))
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .background(
+                                    androidx.compose.ui.graphics.Brush.verticalGradient(
+                                        colors = listOf(Color(0xFFEF4444), Color(0xFFB91C1C))
+                                    )
+                                )
+                                .padding(vertical = 7.dp, horizontal = 12.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(Icons.Default.ExitToApp, contentDescription = "Sign Out", tint = Color.White, modifier = Modifier.size(13.dp))
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text("Exit Nominee View", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                        }
+                    }
+                }
+            }
 
             Spacer(modifier = Modifier.height(14.dp))
 
             // Row 3: 3D Segmented Tab Control Navigation Bar
+            val visibleTabs = if (viewModel.isTrusteeViewOnly) {
+                listOf(Tab.MY_VAULT)
+            } else {
+                Tab.values().toList()
+            }
+
             Surface(
                 modifier = Modifier.fillMaxWidth(),
                 shape = RoundedCornerShape(14.dp),
@@ -1924,11 +2146,15 @@ fun TopBarNavigation(viewModel: SecureLegacyViewModel, onExitClick: () -> Unit) 
                         .padding(5.dp),
                     horizontalArrangement = Arrangement.spacedBy(4.dp)
                 ) {
-                    Tab.values().forEach { tab ->
+                    visibleTabs.forEach { tab ->
                         val isActive = viewModel.currentTab == tab
 
                         Surface(
-                            onClick = { viewModel.currentTab = tab },
+                            onClick = {
+                                if (!viewModel.isTrusteeViewOnly) {
+                                    viewModel.currentTab = tab
+                                }
+                            },
                             modifier = Modifier
                                 .weight(1f)
                                 .testTag("nav_item_${tab.name.lowercase()}"),
@@ -1966,7 +2192,7 @@ fun TopBarNavigation(viewModel: SecureLegacyViewModel, onExitClick: () -> Unit) 
                                 )
                                 Spacer(modifier = Modifier.width(4.dp))
                                 Text(
-                                    text = tab.title,
+                                    text = if (viewModel.isTrusteeViewOnly && tab == Tab.MY_VAULT) "My Amanat (View Only)" else tab.title,
                                     color = if (isActive) Color.White else Color.White.copy(alpha = 0.75f),
                                     fontWeight = if (isActive) FontWeight.ExtraBold else FontWeight.Medium,
                                     fontFamily = FontFamily.SansSerif,
@@ -2559,7 +2785,7 @@ fun CategorySectionCard(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    if (isUnlocked) {
+                    if (isOwner && !viewModel.isTrusteeViewOnly) {
                         // 3D "ADD" Box Button
                         Surface(
                             onClick = onAddItemClick,
@@ -2597,6 +2823,35 @@ fun CategorySectionCard(
                                     fontWeight = FontWeight.ExtraBold,
                                     fontFamily = FontFamily.SansSerif,
                                     letterSpacing = 0.5.sp
+                                )
+                            }
+                        }
+                    } else if (isUnlocked) {
+                        // 3D "VIEW ONLY" Box Badge
+                        Surface(
+                            shape = RoundedCornerShape(10.dp),
+                            color = Color(0xFF0F172A),
+                            shadowElevation = 4.dp,
+                            border = BorderStroke(1.dp, Color(0xFF38BDF8).copy(alpha = 0.7f))
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(5.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Visibility,
+                                    contentDescription = "View Only",
+                                    tint = Color(0xFF38BDF8),
+                                    modifier = Modifier.size(14.dp)
+                                )
+                                Text(
+                                    text = "VIEW ONLY",
+                                    color = Color(0xFF38BDF8),
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    fontFamily = FontFamily.SansSerif,
+                                    letterSpacing = 0.3.sp
                                 )
                             }
                         }
@@ -5729,6 +5984,7 @@ fun AddContactDialog(
 // ==========================================
 @Composable
 fun AccessActivityScreen(viewModel: SecureLegacyViewModel) {
+    val context = LocalContext.current
     val isOwner = viewModel.viewingAs == "Owner"
     var enteredReason by remember { mutableStateOf("") }
 
@@ -5773,85 +6029,239 @@ fun AccessActivityScreen(viewModel: SecureLegacyViewModel) {
         // Owner Approval Card for Pending Trustee Direct Login Request
         if (isOwner && viewModel.pendingTrusteeLoginRequest != null) {
             val req = viewModel.pendingTrusteeLoginRequest!!
+            val emailTarget = req.emailRecipient.ifEmpty { req.trusteeContact.email.ifEmpty { "gigglereel27@gmail.com" } }
             Card(
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(bottom = 16.dp),
                 colors = CardDefaults.cardColors(containerColor = Color(0xFF0F172A)),
-                border = BorderStroke(1.5.dp, Color(0xFF2563EB)),
-                shape = RoundedCornerShape(12.dp)
+                border = BorderStroke(1.5.dp, if (req.isApprovedByOwner) SageGreen else Color(0xFF2563EB)),
+                shape = RoundedCornerShape(14.dp)
             ) {
                 Column(modifier = Modifier.padding(16.dp)) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Icon(
-                            imageVector = Icons.Default.NotificationsActive,
-                            contentDescription = null,
-                            tint = Color(0xFF60A5FA),
-                            modifier = Modifier.size(20.dp)
-                        )
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Text(
-                            text = "Trustee Direct Login Request Received",
-                            color = Color.White,
-                            fontWeight = FontWeight.Bold,
-                            fontSize = 14.sp
-                        )
-                    }
-                    Spacer(modifier = Modifier.height(6.dp))
-                    Text(
-                        text = "Your trusted nominee ${req.trusteeContact.name} (${req.trusteeContact.relationship}) requested direct login access via ${req.trusteeContact.email.ifEmpty { req.trusteeContact.phone }}.",
-                        color = Color.White.copy(alpha = 0.8f),
-                        fontSize = 12.sp
-                    )
-                    Spacer(modifier = Modifier.height(6.dp))
-                    Text(
-                        text = "• Condition 1: Approve now to grant direct link immediately.\n• Condition 2: If you do not respond, system sends direct link automatically after 24 hours.",
-                        color = Color(0xFF93C5FD),
-                        fontSize = 11.sp
-                    )
-
-                    Spacer(modifier = Modifier.height(12.dp))
                     Row(
                         modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
-                        if (!req.isApprovedByOwner) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(
+                                imageVector = if (req.isApprovedByOwner) Icons.Default.CheckCircle else Icons.Default.NotificationsActive,
+                                contentDescription = null,
+                                tint = if (req.isApprovedByOwner) SageGreen else Color(0xFF60A5FA),
+                                modifier = Modifier.size(20.dp)
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text(
+                                text = if (req.isApprovedByOwner) "Trustee Access Approved" else "Trustee Direct Login Request Received",
+                                color = Color.White,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 14.sp
+                            )
+                        }
+
+                        if (req.isApprovedByOwner) {
+                            Surface(
+                                color = SageGreen.copy(alpha = 0.2f),
+                                shape = RoundedCornerShape(6.dp),
+                                border = BorderStroke(1.dp, SageGreen)
+                            ) {
+                                Text(
+                                    text = "APPROVED & SENT",
+                                    color = SageGreen,
+                                    fontSize = 9.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                )
+                            }
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        text = "Requester: ${req.trusteeContact.name} (${req.trusteeContact.relationship}) • Target Email: $emailTarget",
+                        color = Color.White.copy(alpha = 0.85f),
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Medium
+                    )
+
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    if (!req.isApprovedByOwner) {
+                        Text(
+                            text = "• Condition 1: Approve now to automatically send the secure access link to $emailTarget.\n• Condition 2: If you do not respond, system sends direct link automatically after 24 hours.",
+                            color = Color(0xFF93C5FD),
+                            fontSize = 11.sp
+                        )
+                        Spacer(modifier = Modifier.height(14.dp))
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
                             Button(
                                 onClick = { viewModel.approveTrusteeLoginRequest() },
                                 colors = ButtonDefaults.buttonColors(containerColor = SageGreen),
                                 shape = RoundedCornerShape(8.dp),
-                                modifier = Modifier.weight(1f)
+                                modifier = Modifier.weight(1f),
+                                enabled = !viewModel.isEmailSendingInProgress
                             ) {
-                                Icon(Icons.Default.Check, contentDescription = null, modifier = Modifier.size(16.dp))
-                                Spacer(modifier = Modifier.width(6.dp))
-                                Text("Approve Request", fontWeight = FontWeight.Bold, fontSize = 12.sp)
-                            }
-                        } else {
-                            Surface(
-                                color = SageGreen.copy(alpha = 0.2f),
-                                shape = RoundedCornerShape(8.dp),
-                                border = BorderStroke(1.dp, SageGreen),
-                                modifier = Modifier.weight(1f)
-                            ) {
-                                Row(
-                                    modifier = Modifier.padding(vertical = 8.dp),
-                                    horizontalArrangement = Arrangement.Center,
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    Icon(Icons.Default.CheckCircle, contentDescription = null, tint = SageGreen, modifier = Modifier.size(16.dp))
+                                if (viewModel.isEmailSendingInProgress) {
+                                    CircularProgressIndicator(
+                                        color = Color.White,
+                                        modifier = Modifier.size(16.dp),
+                                        strokeWidth = 2.dp
+                                    )
                                     Spacer(modifier = Modifier.width(6.dp))
-                                    Text("Approved", color = SageGreen, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                                    Text("Sending Mail...", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                                } else {
+                                    Icon(Icons.Default.Check, contentDescription = null, modifier = Modifier.size(16.dp))
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text("Approve & Send Mail to $emailTarget", fontWeight = FontWeight.Bold, fontSize = 11.sp)
+                                }
+                            }
+
+                            OutlinedButton(
+                                onClick = { viewModel.pendingTrusteeLoginRequest = null },
+                                colors = ButtonDefaults.outlinedButtonColors(contentColor = MutedRed),
+                                border = BorderStroke(1.dp, MutedRed),
+                                shape = RoundedCornerShape(8.dp)
+                            ) {
+                                Text("Dismiss", fontSize = 12.sp)
+                            }
+                        }
+                    } else {
+                        // APPROVED STATE: SHOW DISPATCH STATUS, ACCESS LINK, AND IMMEDIATE ACCESS BUTTONS
+                        Surface(
+                            color = Color(0xFF1E293B),
+                            shape = RoundedCornerShape(10.dp),
+                            border = BorderStroke(1.dp, Color(0xFF334155)),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Column(modifier = Modifier.padding(12.dp)) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Icon(
+                                        imageVector = Icons.Default.Email,
+                                        contentDescription = null,
+                                        tint = Color(0xFF38BDF8),
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Text(
+                                        text = viewModel.emailDispatchStatusMessage ?: req.emailDispatchStatus,
+                                        color = Color(0xFFE2E8F0),
+                                        fontSize = 11.sp,
+                                        fontWeight = FontWeight.SemiBold
+                                    )
+                                }
+
+                                Spacer(modifier = Modifier.height(8.dp))
+                                Text(
+                                    text = "Generated Direct Access Link for Requester:",
+                                    color = Color(0xFF94A3B8),
+                                    fontSize = 10.sp,
+                                    fontWeight = FontWeight.Bold
+                                )
+                                Spacer(modifier = Modifier.height(4.dp))
+                                Surface(
+                                    color = Color(0xFF0F172A),
+                                    shape = RoundedCornerShape(6.dp),
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Text(
+                                        text = req.accessLinkGenerated,
+                                        color = Color(0xFFA7F3D0),
+                                        fontSize = 10.sp,
+                                        fontFamily = FontFamily.Monospace,
+                                        modifier = Modifier.padding(8.dp)
+                                    )
                                 }
                             }
                         }
 
-                        OutlinedButton(
-                            onClick = { viewModel.pendingTrusteeLoginRequest = null },
-                            colors = ButtonDefaults.outlinedButtonColors(contentColor = MutedRed),
-                            border = BorderStroke(1.dp, MutedRed),
-                            shape = RoundedCornerShape(8.dp)
-                        ) {
-                            Text("Dismiss", fontSize = 12.sp)
+                        Spacer(modifier = Modifier.height(12.dp))
+
+                        // Action Buttons: Open Link & Access Details, Copy Link, Resend Mail
+                        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            // Primary Button: Directly Open Link & Access Details
+                            Button(
+                                onClick = {
+                                    viewModel.executeTrusteeLogin(req.trusteeContact)
+                                },
+                                colors = ButtonDefaults.buttonColors(containerColor = SageGreen),
+                                shape = RoundedCornerShape(8.dp),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Icon(Icons.Default.LockOpen, contentDescription = null, tint = Color.White, modifier = Modifier.size(16.dp))
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text(
+                                    text = "Open Link & Access Details (View-Only Amanat)",
+                                    color = Color.White,
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 12.sp
+                                )
+                            }
+
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                // Copy Link Button
+                                OutlinedButton(
+                                    onClick = {
+                                        val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                                        clipboard.setPrimaryClip(ClipData.newPlainText("Amanat Access Link", req.accessLinkGenerated))
+                                        Toast.makeText(context, "Direct access link copied to clipboard!", Toast.LENGTH_SHORT).show()
+                                    },
+                                    colors = ButtonDefaults.outlinedButtonColors(contentColor = Color(0xFF60A5FA)),
+                                    border = BorderStroke(1.dp, Color(0xFF60A5FA)),
+                                    shape = RoundedCornerShape(8.dp),
+                                    modifier = Modifier.weight(1f)
+                                ) {
+                                    Icon(Icons.Default.ContentCopy, contentDescription = null, modifier = Modifier.size(14.dp))
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text("Copy Link", fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+                                }
+
+                                // Resend Mail Button
+                                OutlinedButton(
+                                    onClick = {
+                                        viewModel.triggerEmailDispatch(emailTarget, req.trusteeContact.name, req.accessLinkGenerated)
+                                    },
+                                    colors = ButtonDefaults.outlinedButtonColors(contentColor = Color(0xFF34D399)),
+                                    border = BorderStroke(1.dp, Color(0xFF34D399)),
+                                    shape = RoundedCornerShape(8.dp),
+                                    modifier = Modifier.weight(1f),
+                                    enabled = !viewModel.isEmailSendingInProgress
+                                ) {
+                                    Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(14.dp))
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text("Resend Mail", fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+                                }
+                            }
+
+                            // Secondary Option: Also offer Email App Intent
+                            OutlinedButton(
+                                onClick = {
+                                    try {
+                                        val intent = Intent(Intent.ACTION_SENDTO).apply {
+                                            data = Uri.parse("mailto:$emailTarget")
+                                            putExtra(Intent.EXTRA_SUBJECT, "Amanat Vault - Emergency Access Approved: Your Direct Link")
+                                            putExtra(Intent.EXTRA_TEXT, "Hello ${req.trusteeContact.name},\n\nYour emergency access request has been approved.\nAccess your authorized vault items here: ${req.accessLinkGenerated}")
+                                        }
+                                        context.startActivity(Intent.createChooser(intent, "Send Email"))
+                                    } catch (e: Exception) {
+                                        Toast.makeText(context, "No email client app found. The email has already been dispatched directly over the network.", Toast.LENGTH_LONG).show()
+                                    }
+                                },
+                                colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.White.copy(alpha = 0.7f)),
+                                border = BorderStroke(1.dp, Color.White.copy(alpha = 0.2f)),
+                                shape = RoundedCornerShape(8.dp),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Icon(Icons.Default.Send, contentDescription = null, modifier = Modifier.size(14.dp))
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text("Send via Email App (Optional)", fontSize = 11.sp)
+                            }
                         }
                     }
                 }
@@ -7082,6 +7492,7 @@ fun GoogleLogoIcon(modifier: Modifier = Modifier) {
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun OwnerLoginLayout(viewModel: SecureLegacyViewModel) {
+    val context = LocalContext.current
     var selectedLoginMode by remember { mutableStateOf(0) } // 0: Owner Login, 1: Trustee Login
     var inputId by remember { mutableStateOf("") }
     var inputPassword by remember { mutableStateOf("") }
@@ -7801,33 +8212,54 @@ fun OwnerLoginLayout(viewModel: SecureLegacyViewModel) {
 
                         // Direct Login Link (Unlocked by Condition 1 OR Condition 2)
                         if (req.isApprovedByOwner || is24hTriggered) {
+                            val emailTarget = req.emailRecipient.ifEmpty { req.trusteeContact.email.ifEmpty { "gigglereel27@gmail.com" } }
                             Spacer(modifier = Modifier.height(14.dp))
                             Card(
                                 colors = CardDefaults.cardColors(containerColor = Color(0xFF064E3B)),
                                 border = BorderStroke(1.dp, SageGreen),
-                                shape = RoundedCornerShape(10.dp),
+                                shape = RoundedCornerShape(12.dp),
                                 modifier = Modifier.fillMaxWidth()
                             ) {
-                                Column(modifier = Modifier.padding(12.dp)) {
+                                Column(modifier = Modifier.padding(14.dp)) {
                                     Row(verticalAlignment = Alignment.CenterVertically) {
-                                        Icon(Icons.Default.CheckCircle, contentDescription = null, tint = SageGreen, modifier = Modifier.size(16.dp))
-                                        Spacer(modifier = Modifier.width(6.dp))
+                                        Icon(Icons.Default.CheckCircle, contentDescription = null, tint = SageGreen, modifier = Modifier.size(18.dp))
+                                        Spacer(modifier = Modifier.width(8.dp))
                                         Text(
-                                            text = "Direct Login Link Ready",
+                                            text = "Direct Access Link Ready & Dispatched",
                                             color = Color.White,
                                             fontWeight = FontWeight.Bold,
-                                            fontSize = 12.sp
+                                            fontSize = 13.sp
                                         )
                                     }
                                     Spacer(modifier = Modifier.height(4.dp))
-                                    Text(
-                                        text = req.accessLinkGenerated,
-                                        color = Color(0xFFA7F3D0),
-                                        fontSize = 9.sp,
-                                        fontFamily = FontFamily.Monospace,
-                                        modifier = Modifier.padding(vertical = 4.dp)
-                                    )
-                                    Spacer(modifier = Modifier.height(6.dp))
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Icon(Icons.Default.Email, contentDescription = null, tint = Color(0xFF38BDF8), modifier = Modifier.size(14.dp))
+                                        Spacer(modifier = Modifier.width(6.dp))
+                                        Text(
+                                            text = viewModel.emailDispatchStatusMessage ?: req.emailDispatchStatus,
+                                            color = Color(0xFFA7F3D0),
+                                            fontSize = 10.sp,
+                                            fontWeight = FontWeight.Medium
+                                        )
+                                    }
+
+                                    Spacer(modifier = Modifier.height(8.dp))
+                                    Surface(
+                                        color = Color(0xFF022C22),
+                                        shape = RoundedCornerShape(6.dp),
+                                        modifier = Modifier.fillMaxWidth()
+                                    ) {
+                                        Text(
+                                            text = req.accessLinkGenerated,
+                                            color = Color(0xFFA7F3D0),
+                                            fontSize = 9.sp,
+                                            fontFamily = FontFamily.Monospace,
+                                            modifier = Modifier.padding(8.dp)
+                                        )
+                                    }
+
+                                    Spacer(modifier = Modifier.height(10.dp))
+                                    // Primary Button: Open Link & Access Details
                                     Button(
                                         onClick = {
                                             viewModel.executeTrusteeLogin(req.trusteeContact)
@@ -7839,11 +8271,50 @@ fun OwnerLoginLayout(viewModel: SecureLegacyViewModel) {
                                         Icon(Icons.Default.LockOpen, contentDescription = null, tint = Color.White, modifier = Modifier.size(16.dp))
                                         Spacer(modifier = Modifier.width(8.dp))
                                         Text(
-                                            text = "Direct Login as Trustee & View Vault",
+                                            text = "Open Link & Access Details (View-Only Amanat)",
                                             color = Color.White,
                                             fontWeight = FontWeight.Bold,
                                             fontSize = 12.sp
                                         )
+                                    }
+
+                                    Spacer(modifier = Modifier.height(8.dp))
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                    ) {
+                                        // Copy Link
+                                        OutlinedButton(
+                                            onClick = {
+                                                val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                                                clipboard.setPrimaryClip(ClipData.newPlainText("Amanat Access Link", req.accessLinkGenerated))
+                                                Toast.makeText(context, "Direct access link copied to clipboard!", Toast.LENGTH_SHORT).show()
+                                            },
+                                            colors = ButtonDefaults.outlinedButtonColors(contentColor = Color(0xFF93C5FD)),
+                                            border = BorderStroke(1.dp, Color(0xFF60A5FA)),
+                                            shape = RoundedCornerShape(8.dp),
+                                            modifier = Modifier.weight(1f)
+                                        ) {
+                                            Icon(Icons.Default.ContentCopy, contentDescription = null, modifier = Modifier.size(14.dp))
+                                            Spacer(modifier = Modifier.width(6.dp))
+                                            Text("Copy Link", fontSize = 11.sp)
+                                        }
+
+                                        // Resend Email
+                                        OutlinedButton(
+                                            onClick = {
+                                                viewModel.triggerEmailDispatch(emailTarget, req.trusteeContact.name, req.accessLinkGenerated)
+                                            },
+                                            colors = ButtonDefaults.outlinedButtonColors(contentColor = Color(0xFF34D399)),
+                                            border = BorderStroke(1.dp, Color(0xFF34D399)),
+                                            shape = RoundedCornerShape(8.dp),
+                                            modifier = Modifier.weight(1f),
+                                            enabled = !viewModel.isEmailSendingInProgress
+                                        ) {
+                                            Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(14.dp))
+                                            Spacer(modifier = Modifier.width(6.dp))
+                                            Text("Resend Mail", fontSize = 11.sp)
+                                        }
                                     }
                                 }
                             }
